@@ -1,0 +1,66 @@
+
+data_path ./mock_data/cosmo_2000.0_z0.5_gauss_8.0_128.npy
+save_path ./examples/result
+
+boxsize 2000.0
+redshift 0.5
+which_pk cosmo
+
+which_ics varied_ics
+collect_ics 0
+
+### grid params
+ng 128
+ng_L 192
+ng_E 128
+#ng_cut 128
+#ng_e 128
+
+### forword model
+model_name gauss
+
+### MAS params, default is CIC with interlace
+window_order 2
+interlace 1
+
+### likelihood in which space
+which_space k_space
+#which_space r_space
+
+### cosmo params ('trueth')
+#A 1.0
+sigma8 0.8350423924781689
+oc 0.11933
+hubble 0.73
+
+### bias params
+#b1 2.0
+#b2 -0.5
+#bG2 -0.5
+#bGamma3 0.0
+#cs2 0.0
+#c1 0.0
+#Sigma2 0.0
+#Sigma2_mu2 0.0
+
+### err params
+log_Perr 8.0
+#fixed_log_Perr 8.0
+
+#dense_mass A oc hubble b1 b2 bG2 cs2 log_Perr
+#dense_mass A oc hubble log_Perr
+#dense_mass A oc hubble
+dense_mass sigma8 oc hubble
+#dense_mass sigma8 oc hubble log_Perr
+
+kmax 0.1
+
+### mcmc params
+i_chain 0
+thin 1
+n_samples 10000
+n_warmup 1000
+accept_rate 0.8
+mcmc_seed 10
+i_contd 0
+

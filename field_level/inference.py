@@ -19,13 +19,13 @@ import time
 import scipy.special
 import dill
 
-from JAX_Zenbu import Zenbu
-from Zenbu_utils.loginterp_jax import loginterp_jax
+from field_level.JAX_Zenbu import Zenbu
+from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
 
-import coord
-import forward_model as forward_model
-import util
-import cosmo_util
+import field_level.coord as coord
+import field_level.forward_model as forward_model
+import field_level.util as utiil
+import field_level.cosmo_util as cosmo_util
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -103,9 +103,9 @@ def field_inference(boxsize, redshift, which_pk,
             'Sigma2_mu2' : the coefficient in exp(-0.5 k^2 \mu^2 \Sigma2)
 
     err_params : dict
-        The error (in the likelihood) parameters to sample. The keys should be
+        The error (in the likelihood) parameters to sample (or not). The keys should be
             'log_Perr' : The logarithm of the (white) noise power spectrum
-    
+            'fixed_log_Perr' : The logarithm of the (white) noise power spectrum, and will not sample it.
     
     kmax : float
         The maximum k used in the likelihood.
@@ -122,8 +122,8 @@ def field_inference(boxsize, redshift, which_pk,
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
     i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
-    if 'fixed_log_Perr' in kwargs.keys():
-        fixed_log_Perr = kwargs['fixed_log_Perr']
+    if 'fixed_log_Perr' in err_params.keys():
+        fixed_log_Perr = err_params.pop('fixed_log_Perr')
         print('fixed_log_Perr = ', fixed_log_Perr, file=sys.stderr)
 
     vol = boxsize*boxsize*boxsize
@@ -214,7 +214,7 @@ def field_inference(boxsize, redshift, which_pk,
     
         return fieldk_1d_ind
     
-    ### load a mock data    
+    ### load a mock data
     if type(data_path) is str:
         print(f'Loading the data from {data_path}...', file=sys.stderr)
         datak = np.load(data_path) ### data = signal + noise

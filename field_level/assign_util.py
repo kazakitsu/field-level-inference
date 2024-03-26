@@ -10,7 +10,7 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-import coord
+import field_level.coord as coord
 
 @partial(jit, static_argnums=(1, 5, 6, ))
 def assign(boxsize, ng, weight, pos, field, window_order, interlace=0, contd=0):

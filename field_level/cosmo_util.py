@@ -5,12 +5,12 @@ import numpy as np
 import jax.numpy as jnp
 from jax import jit
 from functools import partial
-from Zenbu_utils.loginterp_jax import loginterp_jax
+from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
 
 import jax
 jax.config.update("jax_enable_x64", True)
 
-import util
+import field_level.util
 
 @jit
 def growth_D(z, OM0):

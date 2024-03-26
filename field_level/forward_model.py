@@ -9,16 +9,15 @@ import gc
 import jax
 import time
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
-from JAX_Zenbu import Zenbu
-from Zenbu_utils.loginterp_jax import loginterp_jax
+from field_level.JAX_Zenbu import Zenbu
+from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
 
 jax.config.update("jax_enable_x64", True)
 
-import coord
-import assign_util
-import util
-import cosmo_util
-
+import field_level.coord as coord
+import field_level.assign_util as assign_util
+import field_level.util as util
+import field_level.cosmo_util as cosmo_util
 
 class Forward_Model:
     def __init__(self, model_name, which_pk, ng_params, boxsize, space, **kwargs):
