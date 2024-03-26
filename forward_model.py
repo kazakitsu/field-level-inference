@@ -297,9 +297,9 @@ class Forward_Model:
                 bL1 = biases[0]
                 if 'cs2' in self.model_name:
                     cs2 = biases[1]
-                    fieldk_E = ( bL1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E = ( bL1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
                 else:
-                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
             elif 'quad' in self.model_name:
                 b1 = biases[0]
                 b2 = biases[1]
@@ -308,9 +308,9 @@ class Forward_Model:
                 G2r_L = self.G2r(delr_L)
                 if 'cs2' in self.model_name:
                     cs2 = biases[3]
-                    fieldk_E = ( b1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
+                    fieldk_E = ( b1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
                 else:
-                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
+                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
             elif 'cubic' in self.model_name:
                 b1 = biases[0]
                 b2 = biases[1]
