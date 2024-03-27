@@ -90,13 +90,16 @@ class Forward_Model:
                 self.k = self.power_emu.modes
                 ### no massive neutrino
                 Pk_emu = self.power_emu.predict(jnp.array(cosmo_params))
-                return jnp.array([self.k, Pk_emu])
+                hubble = cosmo_params[2]
+                return jnp.array([self.k/hubble, Pk_emu*hubble**3])
             elif self.which_pk == 'pow': ###to do
                 pass
             self.initialized_lin_pk = True
         else:
-            Pk_emu = self.power_emu.predict(jnp.array(cosmo_params))
-            return jnp.array([self.k, Pk_emu])
+            if 'cosmo' in self.which_pk:
+                Pk_emu = self.power_emu.predict(jnp.array(cosmo_params))
+                hubble = cosmo_params[2]
+                return jnp.array([self.k/hubble, Pk_emu*hubble**3])
         
     @partial(jit, static_argnums=(0, 3))
     def sigma8(self, cosmo_params, pk_lin, type_integ='trap'):
@@ -105,23 +108,23 @@ class Forward_Model:
         redshift = cosmo_params[-1]
         def sigma8_integ(ln_k):
             k = jnp.exp(ln_k)
-            pk = loginterp_jax(pk_lin[0]/hubble, pk_lin[1]*hubble**3)(k)
+            pk = loginterp_jax(pk_lin[0], pk_lin[1])(k)
             x = k*8.0
             wk = 3.*(jnp.sin(x)/x/x - jnp.cos(x)/x)/x
             return k**3*pk*wk**2/(2.*jnp.pi**2)
         if type_integ == 'trap':
-            x = 8.0*pk_lin[0]/hubble
+            x = 8.0*pk_lin[0]
             wk = 3.*(jnp.sin(x)/x/x - jnp.cos(x)/x)/x
             sigma8 = jnp.sqrt(util.trapezoid(pk_lin[0]**3*pk_lin[1]*wk**2/(2.*jnp.pi**2),
-                                             jnp.log(pk_lin[0]/hubble)) )
+                                             jnp.log(pk_lin[0])) )
         elif type_integ == 'simps':  ### not working
             sigma8 = jnp.sqrt(util.simps(sigma8_integ,
-                                         jnp.log(pk_lin[0]/hubble),
-                                         jnp.log(pk_lin[-1]/hubble), ))
+                                         jnp.log(pk_lin[0]),
+                                         jnp.log(pk_lin[-1]), ))
         elif type_integ == 'romb':  ### not working
             sigma8 = jnp.sqrt(util.romb(sigma8_integ,
-                                        jnp.log(pk_lin[0]/hubble),
-                                        jnp.log(pk_lin[-1]/hubble), ))
+                                        jnp.log(pk_lin[0]),
+                                        jnp.log(pk_lin[-1]), ))
         return sigma8.astype(float)
     
     @partial(jit, static_argnums=(0,))

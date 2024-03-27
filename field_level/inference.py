@@ -448,7 +448,7 @@ def field_inference(boxsize, redshift, which_pk,
             delk_L = [delk_L, noisek_L]
         
         if 'cubic' in model_name:
-            fieldk_model_E = f_model.models(delk_L, biases, pk_lin*hubble**3)
+            fieldk_model_E = f_model.models(delk_L, biases, pk_lin)
         else:
             fieldk_model_E = f_model.models(delk_L, biases)
                                     
