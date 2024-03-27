@@ -269,8 +269,8 @@ def reduce_deltak(ng_red, deltak):
     return deltak_red
 
 #@jit
-# @partial(jit, static_argnums=(1,))
-def gauss_to_delta(gaussian_1d, ng):
+@partial(jit, static_argnums=(1,))
+def gauss_1d_to_3d(gaussian_1d, ng):
     ng2 = ng*ng
     ng3 = ng*ng*ng
     ngo2 = int(ng/2)
@@ -287,75 +287,77 @@ def gauss_to_delta(gaussian_1d, ng):
         coord_cngo2_ahalf_bngo2, coord_cngo2_ahalf_bngo2_conj, \
         coord_cngo2_aall_bhalf, coord_cngo2_aall_bhalf_conj = indep_coord(ng)
     
-    delk_re_1d = jnp.zeros(num)
-    delk_im_1d = jnp.zeros(num)
+    fieldk_re_1d = jnp.zeros(num)
+    fieldk_im_1d = jnp.zeros(num)
     
     ### c=0 plane
-    delk_re_1d = delk_re_1d.at[coord_czero_real].set(gaussian_1d[0:4])
-    delk_im_1d = delk_im_1d.at[coord_czero_real].set(0.)
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_real].set(gaussian_1d[0:4])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_real].set(0.)
     
-    delk_re_1d = delk_re_1d.at[0].set(0.)
+    fieldk_re_1d = fieldk_re_1d.at[0].set(0.)
     
-    delk_re_1d = delk_re_1d.at[coord_czero_azero_bhalf].set(gaussian_1d[4:ngo2+3])
-    delk_im_1d = delk_im_1d.at[coord_czero_azero_bhalf].set(gaussian_1d[ngo2+3:ng+2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_azero_bhalf].set(gaussian_1d[4:ngo2+3])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_azero_bhalf].set(gaussian_1d[ngo2+3:ng+2])
     
-    delk_re_1d = delk_re_1d.at[coord_czero_azero_bhalf_conj].set(delk_re_1d[coord_czero_azero_bhalf])
-    delk_im_1d = delk_im_1d.at[coord_czero_azero_bhalf_conj].set(-delk_im_1d[coord_czero_azero_bhalf])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_azero_bhalf_conj].set(fieldk_re_1d[coord_czero_azero_bhalf])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_azero_bhalf_conj].set(-fieldk_im_1d[coord_czero_azero_bhalf])
     
-    delk_re_1d = delk_re_1d.at[coord_czero_ahalf_bzero].set(gaussian_1d[ng+2:ng+ngo2+1])
-    delk_im_1d = delk_im_1d.at[coord_czero_ahalf_bzero].set(gaussian_1d[ng+ngo2+1:2*ng])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_ahalf_bzero].set(gaussian_1d[ng+2:ng+ngo2+1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_ahalf_bzero].set(gaussian_1d[ng+ngo2+1:2*ng])
 
-    delk_re_1d = delk_re_1d.at[coord_czero_ahalf_bzero_conj].set(delk_re_1d[coord_czero_ahalf_bzero])
-    delk_im_1d = delk_im_1d.at[coord_czero_ahalf_bzero_conj].set(-delk_im_1d[coord_czero_ahalf_bzero])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_ahalf_bzero_conj].set(fieldk_re_1d[coord_czero_ahalf_bzero])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_ahalf_bzero_conj].set(-fieldk_im_1d[coord_czero_ahalf_bzero])
 
-    delk_re_1d = delk_re_1d.at[coord_czero_ahalf_bngo2].set(gaussian_1d[2*ng:2*ng+ngo2-1])
-    delk_im_1d = delk_im_1d.at[coord_czero_ahalf_bngo2].set(gaussian_1d[2*ng+ngo2-1:3*ng-2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_ahalf_bngo2].set(gaussian_1d[2*ng:2*ng+ngo2-1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_ahalf_bngo2].set(gaussian_1d[2*ng+ngo2-1:3*ng-2])
 
-    delk_re_1d = delk_re_1d.at[coord_czero_ahalf_bngo2_conj].set(delk_re_1d[coord_czero_ahalf_bngo2])
-    delk_im_1d = delk_im_1d.at[coord_czero_ahalf_bngo2_conj].set(-delk_im_1d[coord_czero_ahalf_bngo2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_ahalf_bngo2_conj].set(fieldk_re_1d[coord_czero_ahalf_bngo2])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_ahalf_bngo2_conj].set(-fieldk_im_1d[coord_czero_ahalf_bngo2])
 
-    delk_re_1d = delk_re_1d.at[coord_czero_aall_bhalf.ravel()].set(gaussian_1d[3*ng-2:ng2o2+3*ngo2-1])
-    delk_im_1d = delk_im_1d.at[coord_czero_aall_bhalf.ravel()].set(gaussian_1d[ng2o2+3*ngo2-1:ng2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_aall_bhalf.ravel()].set(gaussian_1d[3*ng-2:ng2o2+3*ngo2-1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_aall_bhalf.ravel()].set(gaussian_1d[ng2o2+3*ngo2-1:ng2])
 
-    delk_re_1d = delk_re_1d.at[coord_czero_aall_bhalf_conj.ravel()].set(delk_re_1d[coord_czero_aall_bhalf.ravel()])
-    delk_im_1d = delk_im_1d.at[coord_czero_aall_bhalf_conj.ravel()].set(-delk_im_1d[coord_czero_aall_bhalf.ravel()])
+    fieldk_re_1d = fieldk_re_1d.at[coord_czero_aall_bhalf_conj.ravel()].set(fieldk_re_1d[coord_czero_aall_bhalf.ravel()])
+    fieldk_im_1d = fieldk_im_1d.at[coord_czero_aall_bhalf_conj.ravel()].set(-fieldk_im_1d[coord_czero_aall_bhalf.ravel()])
     
     ### c=ng/2 plane
     
-    delk_re_1d = delk_re_1d.at[coord_cngo2_real].set(gaussian_1d[ng2:ng2+4])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_real].set(0.)
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_real].set(gaussian_1d[ng2:ng2+4])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_real].set(0.)
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_azero_bhalf].set(gaussian_1d[ng2+4:ng2+ngo2+3])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_azero_bhalf].set(gaussian_1d[ng2+ngo2+3:ng2+ng+2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_azero_bhalf].set(gaussian_1d[ng2+4:ng2+ngo2+3])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_azero_bhalf].set(gaussian_1d[ng2+ngo2+3:ng2+ng+2])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_azero_bhalf_conj].set(delk_re_1d[coord_cngo2_azero_bhalf])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_azero_bhalf_conj].set(-delk_im_1d[coord_cngo2_azero_bhalf])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_azero_bhalf_conj].set(fieldk_re_1d[coord_cngo2_azero_bhalf])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_azero_bhalf_conj].set(-fieldk_im_1d[coord_cngo2_azero_bhalf])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_ahalf_bzero].set(gaussian_1d[ng2+ng+2:ng2+ng+ngo2+1])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_ahalf_bzero].set(gaussian_1d[ng2+ng+ngo2+1:ng2+2*ng])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_ahalf_bzero].set(gaussian_1d[ng2+ng+2:ng2+ng+ngo2+1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_ahalf_bzero].set(gaussian_1d[ng2+ng+ngo2+1:ng2+2*ng])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_ahalf_bzero_conj].set(delk_re_1d[coord_cngo2_ahalf_bzero])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_ahalf_bzero_conj].set(-delk_im_1d[coord_cngo2_ahalf_bzero])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_ahalf_bzero_conj].set(fieldk_re_1d[coord_cngo2_ahalf_bzero])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_ahalf_bzero_conj].set(-fieldk_im_1d[coord_cngo2_ahalf_bzero])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_ahalf_bngo2].set(gaussian_1d[ng2+2*ng:ng2+2*ng+ngo2-1])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_ahalf_bngo2].set(gaussian_1d[ng2+2*ng+ngo2-1:ng2+3*ng-2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_ahalf_bngo2].set(gaussian_1d[ng2+2*ng:ng2+2*ng+ngo2-1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_ahalf_bngo2].set(gaussian_1d[ng2+2*ng+ngo2-1:ng2+3*ng-2])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_ahalf_bngo2_conj].set(delk_re_1d[coord_cngo2_ahalf_bngo2])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_ahalf_bngo2_conj].set(-delk_im_1d[coord_cngo2_ahalf_bngo2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_ahalf_bngo2_conj].set(fieldk_re_1d[coord_cngo2_ahalf_bngo2])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_ahalf_bngo2_conj].set(-fieldk_im_1d[coord_cngo2_ahalf_bngo2])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_aall_bhalf.ravel()].set(gaussian_1d[ng2+3*ng-2:ng2+ng2o2+3*ngo2-1])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_aall_bhalf.ravel()].set(gaussian_1d[ng2+ng2o2+3*ngo2-1:2*ng2])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_aall_bhalf.ravel()].set(gaussian_1d[ng2+3*ng-2:ng2+ng2o2+3*ngo2-1])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_aall_bhalf.ravel()].set(gaussian_1d[ng2+ng2o2+3*ngo2-1:2*ng2])
 
-    delk_re_1d = delk_re_1d.at[coord_cngo2_aall_bhalf_conj.ravel()].set(delk_re_1d[coord_cngo2_aall_bhalf.ravel()])
-    delk_im_1d = delk_im_1d.at[coord_cngo2_aall_bhalf_conj.ravel()].set(-delk_im_1d[coord_cngo2_aall_bhalf.ravel()])
+    fieldk_re_1d = fieldk_re_1d.at[coord_cngo2_aall_bhalf_conj.ravel()].set(fieldk_re_1d[coord_cngo2_aall_bhalf.ravel()])
+    fieldk_im_1d = fieldk_im_1d.at[coord_cngo2_aall_bhalf_conj.ravel()].set(-fieldk_im_1d[coord_cngo2_aall_bhalf.ravel()])
     
     
-    delk_re_1d = delk_re_1d.reshape(ng,ng,ngo2+1).transpose((2,1,0)).reshape(num)
-    delk_re_1d = delk_re_1d.at[ng2:ng3o2].set(gaussian_1d[2*ng2:ng3o2+ng2])
-    delk_re_1d = delk_re_1d.reshape(ngo2+1,ng,ng).transpose((2,1,0)).reshape(num)
+    fieldk_re_1d = fieldk_re_1d.reshape(ng,ng,ngo2+1).transpose((2,1,0)).reshape(num)
+    fieldk_re_1d = fieldk_re_1d.at[ng2:ng3o2].set(gaussian_1d[2*ng2:ng3o2+ng2])
+    fieldk_re_1d = fieldk_re_1d.reshape(ngo2+1,ng,ng).transpose((2,1,0)).reshape(num)
 
-    delk_im_1d = delk_im_1d.reshape(ng,ng,ngo2+1).transpose((2,1,0)).reshape(num)
-    delk_im_1d = delk_im_1d.at[ng2:ng3o2].set(gaussian_1d[ng3o2+ng2:ng3])
-    delk_im_1d = delk_im_1d.reshape(ngo2+1,ng,ng).transpose((2,1,0)).reshape(num)
+    fieldk_im_1d = fieldk_im_1d.reshape(ng,ng,ngo2+1).transpose((2,1,0)).reshape(num)
+    fieldk_im_1d = fieldk_im_1d.at[ng2:ng3o2].set(gaussian_1d[ng3o2+ng2:ng3])
+    fieldk_im_1d = fieldk_im_1d.reshape(ngo2+1,ng,ng).transpose((2,1,0)).reshape(num)
 
-    return delk_re_1d, delk_im_1d
+    #return fieldk_re_1d, fieldk_im_1d
+    fieldk_3d =  fieldk_re_1d.reshape(ng,ng,ngo2+1) + 1j*fieldk_im_1d.reshape(ng,ng,ngo2+1)
+    return fieldk_3d

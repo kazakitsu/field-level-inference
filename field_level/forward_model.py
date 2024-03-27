@@ -5,7 +5,6 @@ import jax.numpy as jnp
 from jax import jit
 from functools import partial
 import sys
-import gc
 import jax
 import time
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
@@ -28,13 +27,16 @@ class Forward_Model:
         elif len(ng_params) == 5:
             self.ng, self.ng_L, self.ng_E, self.ng_cut, self.ng_e = ng_params
         self.ngo2 = int(self.ng/2)
+        self.ng3_L = self.ng_L*self.ng_L*self.ng_L
         self.ng3_E = self.ng_E*self.ng_E*self.ng_E
+        self.ngo2_E = int(self.ng_E/2)
         self.boxsize = boxsize
         self.kf  = 2*jnp.pi/self.boxsize
         self.vol = self.boxsize**3
         self.space = space
         self.initialized_Zenbu = False
         self.initialized_lin_pk = False
+        self.rsd_flag = False
         print('model = ', self.model_name, file=sys.stderr)
         if 'lpt' in model_name:
             self.window_order, self.interlace = kwargs['mas_params']
@@ -45,8 +47,8 @@ class Forward_Model:
                 self.lpt_order = 1
             elif '2lpt' in model_name:
                 self.lpt_order = 2
-            if 'zelrsd' in model_name:
-                self.rsd_flag = True
+        if 'rsd' in model_name:
+            self.rsd_flag = True
 
     #@partial(jit, static_argnums=(0,))
     def kvecs(self, kmax):
@@ -97,12 +99,10 @@ class Forward_Model:
             return jnp.array([self.k, Pk_emu])
         
     @partial(jit, static_argnums=(0, 3))
-    def sigma8(self, cosmo_params, pk_lin, type_integ='simps'):
+    def sigma8(self, cosmo_params, pk_lin, type_integ='trap'):
         omega_b, omega_c, hubble = cosmo_params[:3]
         OM = (omega_b + omega_c)/hubble/hubble
         redshift = cosmo_params[-1]
-        #if redshift != 0.0:
-        #    raise ValueError('z != 0.0 in the sigma8 computation!')
         def sigma8_integ(ln_k):
             k = jnp.exp(ln_k)
             pk = loginterp_jax(pk_lin[0]/hubble, pk_lin[1]*hubble**3)(k)
@@ -114,20 +114,14 @@ class Forward_Model:
             wk = 3.*(jnp.sin(x)/x/x - jnp.cos(x)/x)/x
             sigma8 = jnp.sqrt(util.trapezoid(pk_lin[0]**3*pk_lin[1]*wk**2/(2.*jnp.pi**2),
                                              jnp.log(pk_lin[0]/hubble)) )
-            ### this tmp_sigma8 is @ z=redshift, not @ z=0.0
-            #sigma8 /= cosmo_util.growth_D(redshift, OM)
-        elif type_integ == 'simps':
+        elif type_integ == 'simps':  ### not working
             sigma8 = jnp.sqrt(util.simps(sigma8_integ,
                                          jnp.log(pk_lin[0]/hubble),
                                          jnp.log(pk_lin[-1]/hubble), ))
-            ### this tmp_sigma8 is @ z=redshift, not @ z=0.0
-            #sigma8 /= cosmo_util.growth_D(redshift, OM)
-        elif type_integ == 'romb':
+        elif type_integ == 'romb':  ### not working
             sigma8 = jnp.sqrt(util.romb(sigma8_integ,
                                         jnp.log(pk_lin[0]/hubble),
                                         jnp.log(pk_lin[-1]/hubble), ))
-            ### this tmp_sigma8 is @ z=redshift, not @ z=0.0
-            #sigma8 /= cosmo_util.growth_D(redshift, OM)
         return sigma8.astype(float)
     
     @partial(jit, static_argnums=(0,))
@@ -145,17 +139,17 @@ class Forward_Model:
             pass
 
     def call_Zenbu(self, cosmo_params, kmax):
-        print('Preparing the transfer functions...', file=sys.stderr)
-        extrap_min = -3.5
-        extrap_max = 1.5
-        N = 500
+        print('Preparing the function to compute transfer functions...', file=sys.stderr)
+        self.extrap_min = -3.5
+        self.extrap_max = 1.5
+        self.N = 500
         
         hubble = cosmo_params[2]
-        kint = jnp.logspace(extrap_min, extrap_max, N)
+        self.kint = jnp.logspace(self.extrap_min, self.extrap_max, self.N)
         #print('self.k.shape = ', self.k.shape, file=sys.stderr)
         #print('self.power_emu.predict(cosmo_params).shape = ', self.power_emu.predict(cosmo_params).shape, file=sys.stderr)
         pint_base = loginterp_jax(self.k/hubble,
-                                  self.power_emu.predict(jnp.array(cosmo_params))*hubble*hubble*hubble)(kint)
+                                  self.power_emu.predict(jnp.array(cosmo_params))*hubble*hubble*hubble)(self.kint)
         
         kk_min = np.sqrt(self.k2_E[0,0,1]).min()*1.0
         if kmax > 10.0:
@@ -164,11 +158,13 @@ class Forward_Model:
             kk_max = kmax*1.0
         
         NN = 30 
-        self.modPT = Zenbu(kint, pint_base, kmin=kk_min, kmax=kk_max, nk=NN, jn=5)
+        self.modPT = Zenbu(self.kint, pint_base, kmin=kk_min, kmax=kk_max, nk=NN, jn=5)
+        print('Done.', file=sys.stderr)
     
     @partial(jit, static_argnums=(0, ))
-    def transfer_function(self, cosmo_params, pk_lin):
+    def transfer_function(self, pk_lin):
     #def transfer_function(self, cosmo_params, kmax, pk_lin):
+        ### This pk_lin should (k [Mpc/h], P(k) [(h/Mpc)^3]) unit
         '''
         if not self.initialized_Zenbu:
             print('Preparing the transfer functions...', file=sys.stderr)
@@ -195,12 +191,12 @@ class Forward_Model:
             print('Done.', file=sys.stderr)
         else:
         '''
-        hubble =  cosmo_params[2]
-        self.modPT.update_power_spectrum(pk_lin[1]*hubble**3)
+        pint = loginterp_jax(pk_lin[0], pk_lin[1])(self.kint)
+        self.modPT.update_power_spectrum(pint)
         ptable = self.modPT.make_ptable()
-        pdd_E = jnp.interp(np.sqrt(self.k2_E)/hubble, ptable[:,0], ptable[:,1])
-        p1Gamma3_E = -2.*jnp.interp(np.sqrt(self.k2_E)/hubble, ptable[:,0], ptable[:,2])/pdd_E
-        p1S3_E = jnp.interp(np.sqrt(self.k2_E)/hubble, ptable[:,0], ptable[:,3])/pdd_E
+        pdd_E = jnp.interp(np.sqrt(self.k2_E), ptable[:,0], ptable[:,1])
+        p1Gamma3_E = -2.*jnp.interp(np.sqrt(self.k2_E), ptable[:,0], ptable[:,2])/pdd_E
+        p1S3_E = jnp.interp(np.sqrt(self.k2_E), ptable[:,0], ptable[:,3])/pdd_E
         return pdd_E, p1Gamma3_E, p1S3_E
     
     @partial(jit, static_argnums=(0,))
@@ -221,7 +217,7 @@ class Forward_Model:
     
     
     @partial(jit, static_argnums=(0,))
-    def lpt(self, delk_L, *vals):
+    def lpt(self, delk_L, growth_f=0.0):
         disp1k = self.kdisp_L*delk_L
         disp1r = jnp.array([jnp.fft.irfftn(disp1k[0]),
                             jnp.fft.irfftn(disp1k[1]),
@@ -237,9 +233,8 @@ class Forward_Model:
                                   jnp.fft.irfftn(disp2k_L[2])])
             disp2r_L *= self.ng3_L
             pos_x += disp2r_L
-        if self.rsd_flag == True:  ### only the zeldovich is supported in this rsd part 
-            growth_f = vals[0]
-            pos_x = pos_x.at[2].add(growth_f*disp1r[2])
+        if self.rsd_flag:  ### only the zeldovich is supported in this rsd part 
+            pos_x = pos_x.at[2].add( growth_f * disp1r[2] )
         return pos_x
     
     @partial(jit, static_argnums=(0,))
@@ -263,7 +258,7 @@ class Forward_Model:
         G2r_L -= G2r_L.mean()
         return G2r_L
     
-    @partial(jit, static_argnums=(0,))
+    @partial(jit, static_argnums=(0, ))
     def models(self, delk_L, biases, *vals):
         if self.model_name == 'gauss':
             if self.ng_E < self.ng_L:
@@ -272,7 +267,7 @@ class Forward_Model:
                 fieldk_E = coord.func_extend(self.ng_E, delk_L)
         elif self.model_name == 'gauss_rsd':
             b1 = biases[0]
-            growth_f = vals[0]
+            growth_f = biases[-1]
             kaiser_fac = b1 + growth_f * self.mu2_E
             if self.ng_E < self.ng_L:
                 fieldk_E = coord.reduce_deltak(self.ng_E, delk_L)
@@ -282,55 +277,49 @@ class Forward_Model:
         elif '1lpt' in self.model_name:
             delr_L = jnp.fft.irfftn(delk_L)*self.ng3_L
             if self.rsd_flag:
-                pos_x = self.lpt(self, delk_L, vals)
+                pos_x = self.lpt(delk_L, growth_f=biases[-1])
             else:
-                pos_x = self.lpt(self, delk_L)
+                pos_x = self.lpt(delk_L)
+            if 'matter' in self.model_name:
+                fieldk_E = self.L2E(1., pos_x) ### zeldovich matter term
+            else:
+                fieldk_E = jnp.zeros((self.ng_E, self.ng_E, self.ngo2_E+1))
             if 'lin' in self.model_name:
                 b1 = biases[0]
                 if 'cs2' in self.model_name:
                     cs2 = biases[1]
-                    fieldk_E = ( b1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x)
+                    fieldk_E += ( b1 + cs2*self.k2_E ) * self.L2E(delr_L, pos_x)
                 else:
-                    fieldk_E = b1 * self.L2E(self, delr_L, pos_x)
-            elif 'bL1' in self.model_name:
-                bL1 = biases[0]
-                if 'cs2' in self.model_name:
-                    cs2 = biases[1]
-                    fieldk_E = ( bL1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
-                else:
-                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, 1., pos_x)
+                    fieldk_E += b1 * self.L2E(delr_L, pos_x)
             elif 'quad' in self.model_name:
                 b1 = biases[0]
                 b2 = biases[1]
                 bG2 = biases[2]
                 d2r_L = self.d2r(delr_L)
-                G2r_L = self.G2r(delr_L)
+                G2r_L = self.G2r(delk_L)
                 if 'cs2' in self.model_name:
                     cs2 = biases[3]
-                    fieldk_E = ( b1 + cs2*self.k2_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E += ( b1 + cs2*self.k2_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
                 else:
-                    fieldk_E = bL1 * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E += b1 * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
             elif 'cubic' in self.model_name:
                 b1 = biases[0]
                 b2 = biases[1]
                 bG2 = biases[2]
                 bGamma3 = biases[3]
-                if self.rsd_flag == True:
-                    pk_lin = vals[1]
-                else:
-                    pk_lin = vals[0]
+                pk_lin = vals[0]
                 pddk_E, p1Gamma3k_E, p1S3k_E = self.transfer_function(pk_lin)
                 p1Gamma3k_E /= pddk_E
                 p1S3k_E /= pddk_E
                 d2r_L = self.d2r(delr_L)
-                G2r_L = self.G2r(delr_L)
+                G2r_L = self.G2r(delk_L)
                 if 'cs2' in self.model_name:
                     cs2 = biases[4]
-                    fieldk_E = ( b1 + cs2*self.k2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E += ( b1 + cs2*self.k2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
                     if 'c1' in self.model_name:
                         c1 = biases[5]
-                        fieldk_E = ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                        fieldk_E += ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
                 else:
-                    fieldk_E = ( b1 + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(self, delr_L, pos_x) + self.L2E(self, b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E += ( b1 + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
 
         return fieldk_E

@@ -4,7 +4,7 @@
 #SBATCH --output=%x-%j.out
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=kakitsu@ias.edu
-#SBATCH --time=3-00:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --gpus-per-node=1
 
 hostname; pwd; date

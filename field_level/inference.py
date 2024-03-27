@@ -17,7 +17,6 @@ import gc
 import pickle
 import time
 import scipy.special
-import dill
 
 from field_level.JAX_Zenbu import Zenbu
 from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
@@ -67,9 +66,9 @@ def field_inference(boxsize, redshift, which_pk,
             'gauss_rsd : linear gaussian field in redshift space (i.e., Kaiser formula at the field-level)
             '1lpt' + '{bias_model}' : Zeldovich displaced bias fields. 'bias_model' can be
                 'lin' : the linear Eularian bias;   b1
-                'bL1' : the linear Lagrangian bias; bL1
                 'quad': the linear & quadratic biases; b1, b2, bG2
                 'cubic': the linear, quadratic & effective cubic baises; b1, b2, bG2, bGamma3 from the transfer function
+            If you add 'matter' in model_name, the above bias parameters should be regarded as Lagrangian bias
          
     ng_params : (int, int, int)
         The grid sizes for the forwawrd model; (ng, ng_L, ng_E).
@@ -263,8 +262,9 @@ def field_inference(boxsize, redshift, which_pk,
     def model(deltak_data):
         if which_ics=='varied_ics':
             gauss_1d = numpyro.sample("gauss_1d", dist.Normal(0.0, 1.0), sample_shape=(ng3,))
-            gauss_1d_re, gauss_1d_im = coord.gauss_to_delta(gauss_1d, ng)
-            gauss_3d = gauss_1d_re.reshape(ng,ng,ngo2+1) + 1j*gauss_1d_im.reshape(ng,ng,ngo2+1)
+            gauss_3d = coord.gauss_1d_to_3d(gauss_1d, ng)
+            #gauss_1d_re, gauss_1d_im = coord.gauss_to_delta(gauss_1d, ng)
+            #gauss_3d = gauss_1d_re.reshape(ng,ng,ngo2+1) + 1j*gauss_1d_im.reshape(ng,ng,ngo2+1)
         
         if 'cosmo' in which_pk:
             if 'oc' in cosmo_params.keys():
@@ -277,9 +277,9 @@ def field_inference(boxsize, redshift, which_pk,
                 #scaled_h = numpyro.sample('scaled_hubble', dist.Uniform(0.0, 1.0))
                 hubble = numpyro.sample('hubble', dist.Uniform(0.64, 0.82))
                 #hubble = numpyro.deterministic('hubble', 0.64 + (0.82 - 0.64)*scaled_h)
+                H0 = numpyro.deterministic('H0', hubble*100)
             else:
                 hubble = 0.73
-            H0 = numpyro.deterministic('H0', hubble*100)
             #omega_b = numpyro.sample('ob', dist.Uniform(0.01875, 0.02625))
             omega_b = 0.02242
             #ns = numpyro.sample('ns', dist.Uniform(0.84, 1.1))
@@ -387,6 +387,7 @@ def field_inference(boxsize, redshift, which_pk,
             
         if 'rsd' in model_name:
             growth_f = numpyro.deterministic('growth_f', cosmo_util.growth_f_fitting(redshift, OM))
+            biases += [growth_f]
         
         ### err model
         if 'log_Perr' in err_params.keys():
@@ -446,12 +447,8 @@ def field_inference(boxsize, redshift, which_pk,
             noisek_L = coord.func_extend(ng_L, gauss_3d_e)
             delk_L = [delk_L, noisek_L]
         
-        if 'cubic' in model_name and 'rsd' in model_name:
-            fieldk_model_E = f_model.models(delk_L, biases, growth_f, pk_lin)
-        elif 'cubic' in model_name:
-            fieldk_model_E = f_model.models(delk_L, biases, pk_lin)
-        elif 'rsd' in model_name:
-            fieldk_model_E = f_model.models(delk_L, biases, growth_f)
+        if 'cubic' in model_name:
+            fieldk_model_E = f_model.models(delk_L, biases, pk_lin*hubble**3)
         else:
             fieldk_model_E = f_model.models(delk_L, biases)
                                     
@@ -593,6 +590,7 @@ def field_inference(boxsize, redshift, which_pk,
         print('LOADED last state = ', file=sys.stderr)
         print(mcmc.last_state, file=sys.stderr)
     else:
+        mcmc_seed += 12345*i_chain
         rng_key = jax.random.PRNGKey(mcmc_seed)
         print('rng_seed = ', mcmc_seed, file=sys.stderr)
         mcmc.warmup(rng_key, deltak_data=datak_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
@@ -679,7 +677,7 @@ def field_inference(boxsize, redshift, which_pk,
             i = i + i_contd + 1
             with open(f'{save_base}_{i_chain}_{i}_last_state.pkl', 'wb') as f:
                 pickle.dump(mcmc.last_state, f)
-        gc.collect()
+        #gc.collect()
     
     params.append('potential_energy')
 

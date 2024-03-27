@@ -27,7 +27,7 @@ interlace 1
 which_space k_space
 #which_space r_space
 
-### cosmo params ('trueth')
+### cosmo params ('truth')
 #A 1.0
 sigma8 0.8350423924781689
 oc 0.11933
@@ -50,8 +50,8 @@ log_Perr 8.0
 #dense_mass A oc hubble b1 b2 bG2 cs2 log_Perr
 #dense_mass A oc hubble log_Perr
 #dense_mass A oc hubble
-dense_mass sigma8 oc hubble
-#dense_mass sigma8 oc hubble log_Perr
+#dense_mass sigma8 oc hubble
+dense_mass sigma8 oc hubble log_Perr
 
 kmax 0.1
 
