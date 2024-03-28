@@ -64,8 +64,8 @@ def field_inference(boxsize, redshift, which_pk,
         The name of the forward model. Now the following models are supported:
             'gauss' : linear gaussian field in real space
             'gauss_rsd : linear gaussian field in redshift space (i.e., Kaiser formula at the field-level)
-            '1lpt' + '{bias_model}' : Zeldovich displaced bias fields. 'bias_model' can be
-                'lin' : the linear Eularian bias;   b1
+            '1lpt' + '_{bias_model}' : Zeldovich displaced bias fields. 'bias_model' can be
+                'lin' : the linear Eularian bias; b1
                 'quad': the linear & quadratic biases; b1, b2, bG2
                 'cubic': the linear, quadratic & effective cubic baises; b1, b2, bG2, bGamma3 from the transfer function
             If you add 'matter' in model_name, the above bias parameters should be regarded as Lagrangian bias
@@ -78,11 +78,11 @@ def field_inference(boxsize, redshift, which_pk,
     
     mas_params : (int, int)
         The parameters for the assignment scheme; (window_order, interlace)
-        window_order specified the interpolation scheme; 1 is NGP, 2 is CIC and 3 is TSC
+        window_order specifies the interpolation scheme; 1 is NGP, 2 is CIC and 3 is TSC
         interlace == 1 enables for the interlacing
     
     which_space : str
-        In which space the likelihood is evaluating; 'k_space' or 'r_space'. 
+        In which space the likelihood is evaluating; 'k_space' or 'r_space'.  ('r-space' is not implemented here though.)
         
     cosmo_params : dict
         The cosmological parameters to sample. The keys should be
