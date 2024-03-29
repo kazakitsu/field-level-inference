@@ -1,4 +1,3 @@
-
 data_path ./mock_data/cosmo_2000.0_z0.5_gauss_8.0_128.npy
 save_path ./examples/result
 
@@ -63,4 +62,3 @@ n_warmup 1000
 accept_rate 0.8
 mcmc_seed 10
 i_contd 0
-

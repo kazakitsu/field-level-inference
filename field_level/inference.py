@@ -7,16 +7,13 @@ from jax import random
 from numpyro.infer import MCMC, NUTS
 import jax
 import jax.scipy as jsp
-import arviz as az
 from jax import jit
 from functools import partial
 import os
 import sys
 import matplotlib.pyplot as plt
-import gc
 import pickle
 import time
-import scipy.special
 
 from field_level.JAX_Zenbu import Zenbu
 from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
@@ -30,8 +27,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 numpyro.enable_x64()
+print('The inference is running on', jax.default_backend(), file=sys.stderr)
 cpus = jax.devices("cpu")
-gpus = jax.devices("gpu")
 
 def field_inference(boxsize, redshift, which_pk,
                     data_path, save_path,
@@ -254,10 +251,6 @@ def field_inference(boxsize, redshift, which_pk,
         k2_E = coord.rfftn_k2(kvec_E)
         mu2_E = kvec_E[2]*kvec_E[2]/k2_E
         del kvec_E
-
-    print('k2_1d_ind.shape = ', file=sys.stderr)
-    print(k2_1d_ind.shape, file=sys.stderr)
-
 
     def model(deltak_data):
         if which_ics=='varied_ics':
@@ -603,7 +596,7 @@ def field_inference(boxsize, redshift, which_pk,
         criteria = 1.0
         
         if which_ics=='varied_ics':
-            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][2,2]) > criteria)
+            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
         else:
             while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
             
@@ -621,7 +614,7 @@ def field_inference(boxsize, redshift, which_pk,
             i_warmup += 1
             print(inv_mass_matrix, file=sys.stderr)
             
-            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
             print('while = ', while_test, file=sys.stderr)
             
             print('i_warmup = ', i_warmup, file=sys.stderr)
