@@ -153,7 +153,7 @@ def field_inference(boxsize, redshift, which_pk,
     ngo2 = int(ng/2)
         
     if 'lpt' in model_name:
-        f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space, mas_params)
+        f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space, mas_params=mas_params)
     else:
         f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space)
         
@@ -289,12 +289,12 @@ def field_inference(boxsize, redshift, which_pk,
                 true_sigma8 = cosmo_params['sigma8']
                 sigma8 = numpyro.sample('sigma8', dist.Uniform(true_sigma8*0.5, true_sigma8*1.5))
                 pk_lin = f_model.linear_power(cosmo_params_local)
-                tmp_sigma8 = f_model.sigma8(cosmo_params_local, pk_lin, type_integ='trap')
+                tmp_sigma8 = f_model.sigma8(pk_lin, type_integ='trap')
                 A = numpyro.deterministic('A', sigma8/tmp_sigma8)
             elif 'A' in cosmo_params.keys():
                 A = numpyro.sample('A', dist.Uniform(0.5, 1.5))
                 pk_lin = f_model.linear_power(cosmo_params_local)
-                sigma8 = numpyro.deterministic('sigma8', A * f_model.sigma8(cosmo_params_local, pk_lin, type_integ='trap'))
+                sigma8 = numpyro.deterministic('sigma8', A * f_model.sigma8(pk_lin, type_integ='trap'))
             else:
                 A = 1.0
             cosmo_params_local = cosmo_params_local.at[-1].set(redshift)

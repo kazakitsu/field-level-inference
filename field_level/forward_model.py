@@ -101,11 +101,8 @@ class Forward_Model:
                 hubble = cosmo_params[2]
                 return jnp.array([self.k/hubble, Pk_emu*hubble**3])
         
-    @partial(jit, static_argnums=(0, 3))
-    def sigma8(self, cosmo_params, pk_lin, type_integ='trap'):
-        omega_b, omega_c, hubble = cosmo_params[:3]
-        OM = (omega_b + omega_c)/hubble/hubble
-        redshift = cosmo_params[-1]
+    @partial(jit, static_argnums=(0, 2))
+    def sigma8(self, pk_lin, type_integ='trap'):
         def sigma8_integ(ln_k):
             k = jnp.exp(ln_k)
             pk = loginterp_jax(pk_lin[0], pk_lin[1])(k)
@@ -202,15 +199,15 @@ class Forward_Model:
         p1S3_E = jnp.interp(np.sqrt(self.k2_E), ptable[:,0], ptable[:,3])/pdd_E
         return pdd_E, p1Gamma3_E, p1S3_E
     
-    @partial(jit, static_argnums=(0,))
+    #@partial(jit, static_argnums=(0,))
     def L2E(self, weight, pos_x):
         fieldr_E = jnp.zeros((self.ng_E, self.ng_E, self.ng_E))
-        fieldr_E = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E, self.window_order, 0)
+        fieldr_E = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E, self.window_order, interlace=0)
         fieldk_E = jnp.fft.rfftn(fieldr_E)/self.ng3_E
 
         if self.interlace == 1:
             fieldr_E_ = jnp.zeros((self.ng_E, self.ng_E, self.ng_E))
-            fieldr_E_ = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E_, self.window_order, 0)
+            fieldr_E_ = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E_, self.window_order, interlace=1)
             fieldk_E_ = jnp.fft.rfftn(fieldr_E_)/self.ng3_E
             fieldk_E_ *= self.phase_shift_E
             fieldk_E = (fieldk_E + fieldk_E_)*0.5
