@@ -118,6 +118,8 @@ def field_inference(boxsize, redshift, which_pk,
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
     i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
+    if i_contd > 0:
+        n_warmup = 1
     if 'fixed_log_Perr' in err_params.keys():
         fixed_log_Perr = err_params.pop('fixed_log_Perr')
         print('fixed_log_Perr = ', fixed_log_Perr, file=sys.stderr)

@@ -2,6 +2,8 @@
 
 import jax.numpy as jnp
 import jax
+from jax import jit
+from functools import partial
 
 jax.config.update('jax_enable_x64', True)
 
@@ -82,7 +84,7 @@ def power_compute(fieldk_1, fieldk_2, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell=
 
     return k, Pk, Nk
 
-def window_legendre_compute(fieldk, boxsize, nbin=60, kmin=0.0, kmax=0.6, ellmax = 6):
+def window_legendre_compute(fieldk, boxsize, nbin=60, kmin=0.0, kmax=0.6, ellmax=6):
     ng = fieldk.shape[0]
     nell = int(ellmax/2) + 1
 
@@ -146,3 +148,121 @@ def window_legendre_compute(fieldk, boxsize, nbin=60, kmin=0.0, kmax=0.6, ellmax
             window = window.at[ell1, ell2].set(Pk)
             
     return window
+
+def covariance_legendre_compute(pk_3d, boxsize, nbin=60, kmin=0.0, kmax=0.6, ellmax=4):
+    ng = pk_3d.shape[0]
+    nell = int(ellmax/2) + 1
+
+    kvec = coord.rfftn_kvec([ng,ng,ng], boxsize)
+    k2 = (kvec ** 2).sum(axis=0)
+    k_base = jnp.sqrt(k2)
+
+    k_arr = jnp.linspace(kmin, kmax, nbin+1)
+    
+    ### Set the appropriate Nk for each k
+    Nk_base = jnp.full_like(pk_3d, 2, dtype=jnp.int32)
+    Nk_base = Nk_base.at[..., 0].set(1)
+    if pk_3d.shape[-1] % 2 == 0:
+        Nk_base = Nk_base.at[..., -1].set(1)
+    
+    ### Multopoles
+    mu2 = kvec[2]*kvec[2]/k2
+    mu2 = mu2.at[0, 0, 0].set(0.0)
+        
+    L_ells = jnp.ones((nell, pk_3d.shape[0], pk_3d.shape[1], pk_3d.shape[2]))
+    L_ells = L_ells.at[1].set( 0.5   * (3.0*mu2 - 1.0) )
+    L_ells = L_ells.at[2].set( 0.125 * (35.0*mu2*mu2 - 30.0*mu2 + 3.0) )
+    if ellmax > 4:
+        L_ells = L_ells.at[3].set( 0.0625    * (231.*mu2*mu2*mu2 - 315.*mu2*mu2 + 105.*mu2 - 5.) )   ### ell = 6
+    if ellmax > 5:
+        L_ells = L_ells.at[4].set( 0.0078125 * (6435.*mu2*mu2*mu2*mu2  - 12012.*mu2*mu2*mu2 + 6930.*mu2*mu2  - 1260.*mu2 + 35.) ) ### ell = 8
+    if ellmax > 8:
+        L_ells = L_ells.at[5].set( 0.00390625* (46189.*mu2*mu2*mu2*mu2*mu2 - 109395.*mu2*mu2*mu2*mu2 + 90090.*mu2*mu2*mu2 - 30030.*mu2*mu2 + 3465.*mu2 - 63.) ) ### ell = 10
+            
+    ### compuute the covariance
+    cov = jnp.zeros((nell*nbin, nell*nbin))
+    for ell1 in range(nell):
+        legendre_fac1 = 2*2*ell1+1
+        for ell2 in range(nell):
+            legendre_fac2 = 2*2*ell2+1
+            Pk = pk_3d**2
+            Pk *= legendre_fac1*legendre_fac2*L_ells[ell1]*L_ells[ell2]
+            Pk = Pk.at[0,0,0].set(0.0)
+                        
+            k = k_base.ravel()
+            Nk = Nk_base.ravel()
+            Pk = Pk.ravel()
+            
+            kidx = jnp.digitize(k, k_arr, right=True)
+            
+            Pk *= Nk
+    
+            Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
+            Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
+            
+            bmax = jnp.digitize(kmax, k_arr, right=True)
+            Pk = Pk[1:bmax+1]
+            Nk = Nk[1:bmax+1]
+            
+            Pk /= Nk**2
+            Pk *= 2.0
+            
+            for ii in range(nbin):
+                cov = cov.at[ell1*nbin+ii, ell2*nbin+ii].set(Pk[ii])
+            
+    return cov
+
+@partial(jit, static_argnums=(3, 4, 5, 6))
+def power_weight_compute(pk, k_3d, mu2_3d, nbin=60, kmin=0.0, kmax=0.6, ellmax=4):
+    ### pk = [k, Pk]
+    pk_3d = jnp.interp(k_3d, pk[0], pk[1])
+    nell = int(ellmax/2) + 1
+
+    k_arr = jnp.linspace(kmin, kmax, nbin+1)
+    
+    ### Set the appropriate Nk for each k
+    Nk_base = jnp.full_like(pk_3d, 2, dtype=jnp.int32)
+    Nk_base = Nk_base.at[..., 0].set(1)
+    if pk_3d.shape[-1] % 2 == 0:
+        Nk_base = Nk_base.at[..., -1].set(1)
+    
+    ### Multopoles
+        
+    L_ells = jnp.ones((nell, pk_3d.shape[0], pk_3d.shape[1], pk_3d.shape[2]))
+    if ellmax > 0:
+        L_ells = L_ells.at[1].set( 0.5   * (3.0*mu2_3d - 1.0) )
+    if ellmax > 2:
+        L_ells = L_ells.at[2].set( 0.125 * (35.0*mu2_3d*mu2_3d - 30.0*mu2_3d + 3.0) )
+    if ellmax > 4:
+        L_ells = L_ells.at[3].set( 0.0625    * (231.*mu2_3d*mu2_3d*mu2_3d - 315.*mu2_3d*mu2_3d + 105.*mu2_3d - 5.) )   ### ell = 6
+    if ellmax > 5:
+        L_ells = L_ells.at[4].set( 0.0078125 * (6435.*mu2_3d*mu2_3d*mu2_3d*mu2_3d  - 12012.*mu2_3d*mu2_3d*mu2_3d + 6930.*mu2_3d*mu2_3d  - 1260.*mu2_3d + 35.) ) ### ell = 8
+    if ellmax > 8:
+        L_ells = L_ells.at[5].set( 0.00390625* (46189.*mu2_3d*mu2_3d*mu2_3d*mu2_3d*mu2_3d - 109395.*mu2_3d*mu2_3d*mu2_3d*mu2_3d + 90090.*mu2_3d*mu2_3d*mu2_3d - 30030.*mu2_3d*mu2_3d + 3465.*mu2_3d - 63.) ) ### ell = 10
+            
+    ### compuute weighted power spectra
+    Pks = jnp.zeros(nell*nbin)
+    for ell in range(nell):
+        legendre_fac = 2*2*ell+1
+        Pk = pk_3d*legendre_fac*L_ells[ell]
+        Pk = Pk.at[0,0,0].set(0.0)
+                        
+        k = k_3d.ravel()
+        Nk = Nk_base.ravel()
+        Pk = Pk.ravel()
+            
+        kidx = jnp.digitize(k, k_arr, right=True)
+            
+        Pk *= Nk
+    
+        Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
+        Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
+            
+        Pk = Pk[1:nbin+1]
+        Nk = Nk[1:nbin+1]
+            
+        Pk /= Nk
+        
+        Pks = Pks.at[ell*nbin:(ell+1)*nbin].set(Pk)
+
+    return Pks

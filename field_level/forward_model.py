@@ -57,6 +57,8 @@ class Forward_Model:
 
         self.kvec_E = coord.rfftn_kvec([self.ng_E, self.ng_E, self.ng_E], self.boxsize, dtype=float)
         self.k2_E   = coord.rfftn_k2(self.kvec_E)
+        self.mu2_E = self.kvec_E[2]*self.kvec_E[2]/self.k2_E
+        self.mu2_E = self.mu2_E.at[0, 0, 0].set(0.0)
         
         if 'lpt' in self.model_name:
             kvec_L  = coord.rfftn_kvec([self.ng_L, self.ng_L, self.ng_L], self.boxsize, dtype=float)
@@ -69,11 +71,7 @@ class Forward_Model:
             phase_E = jnp.pi*nvec_E.sum(axis=0)/self.ng_E
             self.phase_shift_E = jnp.cos(phase_E) + 1j*jnp.sin(phase_E)
             del nvec_E, phase_E
-            
-        if 'rsd' in self.model_name:
-            self.mu2_E = self.kvec_E[2]*self.kvec_E[2]/self.k2_E
-            self.mu2_E = self.mu2_E.at[0, 0, 0].set(0.0)
-            
+                        
         if kmax > 10.0:
             kmax = int(kmax)
             self.ng_max = kmax
