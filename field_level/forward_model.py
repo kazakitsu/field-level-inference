@@ -6,7 +6,6 @@ from jax import jit
 from functools import partial
 import sys
 import jax
-import time
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
 from field_level.JAX_Zenbu import Zenbu
 from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
@@ -64,7 +63,7 @@ class Forward_Model:
             kvec_L  = coord.rfftn_kvec([self.ng_L, self.ng_L, self.ng_L], self.boxsize, dtype=float)
             #k2_L    = coord.rfftn_k2(kvec_L)
             self.kdisp_L = coord.rfftn_disp(kvec_L)
-            self.kG2_L   = coord.rfftn_G2(kvec_L)
+            self.kG1_L   = coord.rfftn_G1(kvec_L)
         
             nvec_E = self.kvec_E/self.kf
             self.Wk_E   = coord.deconvolve(nvec_E, self.window_order)    
@@ -77,7 +76,7 @@ class Forward_Model:
             self.ng_max = kmax
             kvec_max = coord.rfftn_kvec([self.ng_max, self.ng_max, self.ng_max], self.boxsize, dtype=float)
             self.k2_max = coord.rfftn_k2(kvec_max)
-            self.mu2_max = self.kvec_max[2]*kvec_max[2]/self.k2_max
+            self.mu2_max = kvec_max[2]*kvec_max[2]/self.k2_max
             self.mu2_max = self.mu2_max.at[0, 0, 0].set(0.0)
         
     #@partial(jit, static_argnums=(0,))
@@ -197,15 +196,15 @@ class Forward_Model:
         p1S3_E = jnp.interp(np.sqrt(self.k2_E), ptable[:,0], ptable[:,3])/pdd_E
         return pdd_E, p1Gamma3_E, p1S3_E
     
-    #@partial(jit, static_argnums=(0,))
+    @partial(jit, static_argnums=(0,))
     def L2E(self, weight, pos_x):
         fieldr_E = jnp.zeros((self.ng_E, self.ng_E, self.ng_E))
-        fieldr_E = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E, self.window_order, interlace=0)
+        fieldr_E = assign_util.assign(self.boxsize, fieldr_E, weight, pos_x, self.window_order, interlace=0)
         fieldk_E = jnp.fft.rfftn(fieldr_E)/self.ng3_E
 
         if self.interlace == 1:
             fieldr_E_ = jnp.zeros((self.ng_E, self.ng_E, self.ng_E))
-            fieldr_E_ = assign_util.assign(self.boxsize, self.ng_E, weight, pos_x, fieldr_E_, self.window_order, interlace=1)
+            fieldr_E_ = assign_util.assign(self.boxsize, fieldr_E_, weight, pos_x, self.window_order, interlace=1)
             fieldk_E_ = jnp.fft.rfftn(fieldr_E_)/self.ng3_E
             fieldk_E_ *= self.phase_shift_E
             fieldk_E = (fieldk_E + fieldk_E_)*0.5
@@ -230,7 +229,7 @@ class Forward_Model:
                                   jnp.fft.irfftn(disp2k_L[1]),
                                   jnp.fft.irfftn(disp2k_L[2])])
             disp2r_L *= self.ng3_L
-            pos_x += disp2r_L
+            pos_x = pos_x + disp2r_L
         if self.rsd_flag:  ### only the zeldovich is supported in this rsd part 
             pos_x = pos_x.at[2].add( growth_f * disp1r[2] )
         return pos_x
@@ -238,24 +237,85 @@ class Forward_Model:
     @partial(jit, static_argnums=(0,))
     def d2r(self, delr_L):
         d2r_L = delr_L*delr_L
+        #d2r_L = d2r_L - d2r_L.mean()
         d2r_L -= d2r_L.mean()
         return d2r_L
     
     @partial(jit, static_argnums=(0,))
     def G2r(self, delk_L):
-        G1k_L = self.kG2_L*delk_L
+        G1k_L = self.kG1_L*delk_L
+        ### 0:x, 1:y, 2:z
         G1r00_L = jnp.fft.irfftn(G1k_L[0]) * self.ng3_L
-        G1r10_L = jnp.fft.irfftn(G1k_L[1]) * self.ng3_L
-        G1r20_L = jnp.fft.irfftn(G1k_L[2]) * self.ng3_L
+        G1r01_L = jnp.fft.irfftn(G1k_L[1]) * self.ng3_L
+        G1r02_L = jnp.fft.irfftn(G1k_L[2]) * self.ng3_L
         G1r11_L = jnp.fft.irfftn(G1k_L[3]) * self.ng3_L
-        G1r21_L = jnp.fft.irfftn(G1k_L[4]) * self.ng3_L
+        G1r12_L = jnp.fft.irfftn(G1k_L[4]) * self.ng3_L
         G1r22_L = jnp.fft.irfftn(G1k_L[5]) * self.ng3_L
         
-        phi2r_L = G1r00_L*G1r11_L + G1r11_L*G1r22_L + G1r22_L*G1r00_L - G1r10_L*G1r10_L - G1r20_L*G1r20_L - G1r21_L*G1r21_L
+        phi2r_L = G1r00_L*G1r11_L + G1r11_L*G1r22_L + G1r22_L*G1r00_L - G1r01_L*G1r01_L - G1r02_L*G1r02_L - G1r12_L*G1r12_L
         G2r_L   = -2.0*phi2r_L
-        G2r_L -= G2r_L.mean()
+        G2r_L   -= G2r_L.mean()
+        #G2r_L   = G2r_L - G2r_L.mean()
         return G2r_L
-    
+
+    @partial(jit, static_argnums=(0,))
+    def d3r(self, delr_L):
+        d2r_L = delr_L*delr_L
+        sigma = d2r_L.mean()
+        d3r_L = delr_L*delr_L*delr_L
+        d3r_L = d3r_L - 3.0*sigma*delr_L
+        return d3r_L
+
+    @partial(jit, static_argnums=(0,))
+    def G3r(self, delk_L):
+        G1k_L = self.kG1_L*delk_L
+        G1r00_L = jnp.fft.irfftn(G1k_L[0]) * self.ng3_L
+        G1r01_L = jnp.fft.irfftn(G1k_L[1]) * self.ng3_L
+        G1r02_L = jnp.fft.irfftn(G1k_L[2]) * self.ng3_L
+        G1r11_L = jnp.fft.irfftn(G1k_L[3]) * self.ng3_L
+        G1r12_L = jnp.fft.irfftn(G1k_L[4]) * self.ng3_L
+        G1r22_L = jnp.fft.irfftn(G1k_L[5]) * self.ng3_L
+
+        ### - Det(G1_ij)
+        phi3ar_L = G1r00_L*G1r12_L*G1r12_L + G1r11_L*G1r02_L*G1r02_L + G1r22_L*G1r01_L*G1r01_L - 2.*G1r01_L*G1r02_L*G1r12_L - G1r00_L*G1r11_L*G1r22_L
+        ### multiplying -1./3. results in one of the third order potential in LPT
+        G3r_L   = 3.0*phi3ar_L
+        G3r_L   -= G3r_L.mean()
+        return G3r_L
+
+    @partial(jit, static_argnums=(0,))
+    def Gamma3r(self, delk_L, delr_L):
+        G1k_L = self.kG1_L*delk_L
+        G1r00_L = jnp.fft.irfftn(G1k_L[0]) * self.ng3_L
+        G1r01_L = jnp.fft.irfftn(G1k_L[1]) * self.ng3_L
+        G1r02_L = jnp.fft.irfftn(G1k_L[2]) * self.ng3_L
+        G1r11_L = jnp.fft.irfftn(G1k_L[3]) * self.ng3_L
+        G1r12_L = jnp.fft.irfftn(G1k_L[4]) * self.ng3_L
+        G1r22_L = jnp.fft.irfftn(G1k_L[5]) * self.ng3_L
+
+        phi2r_L = G1r00_L*G1r11_L + G1r11_L*G1r22_L + G1r22_L*G1r00_L - G1r01_L*G1r01_L - G1r02_L*G1r02_L - G1r12_L*G1r12_L
+        G2r_L   = -2.0*phi2r_L
+        G2r_L   -= G2r_L.mean()
+        G2k_L = jnp.fft.rfftn(G2r_L) / self.ng_L
+        G2k_L_ij = self.kG1_L * G2k_L
+
+        G2r00_L = jnp.fft.irfftn(G2k_L_ij[0]) * self.ng3_L
+        G2r01_L = jnp.fft.irfftn(G2k_L_ij[1]) * self.ng3_L
+        G2r02_L = jnp.fft.irfftn(G2k_L_ij[2]) * self.ng3_L
+        G2r11_L = jnp.fft.irfftn(G2k_L_ij[3]) * self.ng3_L
+        G2r12_L = jnp.fft.irfftn(G2k_L_ij[4]) * self.ng3_L
+        G2r22_L = jnp.fft.irfftn(G2k_L_ij[5]) * self.ng3_L
+
+        phi3br_L = 0.5*G1r00_L*(G2r11_L+G2r22_L) + 0.5*G1r11_L*(G2r22_L+G2r00_L) + 0.5*G1r22_L*(G2r00_L+G2r11_L) - G1r01_L*G2r01_L - G1r12_L*G2r12_L - G1r02_L*G2r02_L 
+        ### multiplying -10./21. results in one of the third order potential in LPT
+        ### Gamma3 = -8/7 \phi^(3b)
+        Gamma3r_L   = -8./7.*phi3br_L
+
+        d2r_L = delr_L*delr_L
+        sigma = d2r_L.mean()
+        Gamma3r_L = Gamma3r_L + 32./35.*sigma*delr_L
+        return Gamma3r_L
+        
     @partial(jit, static_argnums=(0, ))
     def models(self, delk_L, biases, *vals):
         if self.model_name == 'gauss':
@@ -271,35 +331,93 @@ class Forward_Model:
                 fieldk_E = coord.reduce_deltak(self.ng_E, delk_L)
             else:
                 fieldk_E = coord.func_extend(self.ng_E, delk_L)
-            fieldk_E *= kaiser_fac
+            fieldk_E = kaiser_fac * fieldk_E
+        elif '1ept_G2' in self.model_name:
+            b1 = biases[0]
+            bG2 = biases[1]
+            G2r_L = self.G2r(delk_L)
+            G2k_L = jnp.fft.rfftn(G2r_L)/self.ng3_L
+            delk_E = coord.func_deltak(self.ng_E, delk_L)
+            G2k_E = coord.func_deltak(self.ng_E, G2k_L)
+            if 'cs2' in self.model_name:
+                cs2 = biases[2]
+            else:
+                cs2 = 0.0
+            fieldk_E = (b1 + cs2)*delk_E + bG2*G2k_E
         elif '1lpt' in self.model_name:
             delr_L = jnp.fft.irfftn(delk_L)*self.ng3_L
             if self.rsd_flag:
                 pos_x = self.lpt(delk_L, growth_f=biases[-1])
             else:
                 pos_x = self.lpt(delk_L)
+            '''
+            if '1lpt_matter_rsd_quad' in self.model_name:
+                print('in the unified way to write the model; almost the same as the previous one', file=sys.stderr)
+                b1 = biases[0]
+                b2 = biases[1]
+                bG2 = biases[2]
+                cs2 = biases[3]
+                c1 = biases[4]
+                c2 = biases[5]
+                d2r_L = self.d2r(delr_L)
+                G2r_L = self.G2r(delk_L)
+                weight_zel = jnp.ones((self.ng_L, self.ng_L, self.ng_L))
+                weight_lin = delr_L
+                weight_quad = b2*d2r_L/2. +  bG2*G2r_L
+                fieldk_zel  = self.L2E(weight_zel,  pos_x)
+                fieldk_lin  = self.L2E(weight_lin,  pos_x)
+                fieldk_quad = self.L2E(weight_quad, pos_x)
+                fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c2*self.k2_E*self.mu2_E*self.mu2_E ) * fieldk_lin + fieldk_quad
+                #fieldk_E = self.L2E(jnp.ones(pos_x.shape[1:]), pos_x) + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c2*self.k2_E*self.mu2_E*self.mu2_E ) * self.L2E(delr_L, pos_x) + self.L2E( b2*d2r_L/2. +  bG2*G2r_L, pos_x)
+            '''
             if 'matter' in self.model_name:
-                fieldk_E = self.L2E(1., pos_x) ### zeldovich matter term
+                weight_zel = jnp.ones((self.ng_L, self.ng_L, self.ng_L))
+                fieldk_zel = self.L2E(weight_zel, pos_x)
             else:
-                fieldk_E = jnp.zeros((self.ng_E, self.ng_E, self.ngo2_E+1))
+                #fieldk_E = jnp.zeros((self.ng_E, self.ng_E, self.ngo2_E+1))
+                fieldk_zel = jnp.zeros((self.ng_E, self.ng_E, self.ngo2_E+1))
             if 'lin' in self.model_name:
                 b1 = biases[0]
-                if 'cs2' in self.model_name:
+                if 'cs2' in self.model_name and 'c1' in self.model_name and 'c2' in self.model_name:
                     cs2 = biases[1]
-                    fieldk_E += ( b1 + cs2*self.k2_E ) * self.L2E(delr_L, pos_x)
+                    c1 = biases[2]
+                    c2 = biases[3]
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c2*self.k2_E*self.mu2_E*self.mu2_E ) * self.L2E(delr_L, pos_x)
+                elif 'cs2' in self.model_name and 'c1' in self.model_name:
+                    cs2 = biases[1]
+                    c1 = biases[2]
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E ) * self.L2E(delr_L, pos_x)
+                elif 'cs2' in self.model_name:
+                    cs2 = biases[1]
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E ) * self.L2E(delr_L, pos_x)
                 else:
-                    fieldk_E += b1 * self.L2E(delr_L, pos_x)
+                    fieldk_E = fieldk_zel + b1 * self.L2E(delr_L, pos_x)
             elif 'quad' in self.model_name:
+                print('in the separete way to write the model; almost the same as the previous one', file=sys.stderr)
                 b1 = biases[0]
                 b2 = biases[1]
                 bG2 = biases[2]
                 d2r_L = self.d2r(delr_L)
                 G2r_L = self.G2r(delk_L)
-                if 'cs2' in self.model_name:
+                weight_lin = delr_L
+                weight_quad = b2*d2r_L/2. +  bG2*G2r_L
+                fieldk_lin  = self.L2E(weight_lin,  pos_x)
+                fieldk_quad = self.L2E(weight_quad, pos_x)
+                if 'cs2' in self.model_name and 'c1' in self.model_name and 'c2' in self.model_name:
                     cs2 = biases[3]
-                    fieldk_E += ( b1 + cs2*self.k2_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
+                    c1 = biases[4]
+                    c2 = biases[5]
+                    #fieldk_E = fieldk_E + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c2*self.k2_E*self.mu2_E*self.mu2_E ) * self.L2E(delr_L, pos_x) + self.L2E(0.5*b2*d2r_L + bG2*G2r_L, pos_x)
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c2*self.k2_E*self.mu2_E*self.mu2_E ) * fieldk_lin + fieldk_quad
+                elif 'cs2' in self.model_name and 'c1' in self.model_name:
+                    cs2 = biases[3]
+                    c1 = biases[4]
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E ) * fieldk_lin + fieldk_quad
+                elif 'cs2' in self.model_name:
+                    cs2 = biases[3]
+                    fieldk_E = fieldk_zel + ( b1 + cs2*self.k2_E ) * fieldk_lin + fieldk_quad
                 else:
-                    fieldk_E += b1 * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
+                    fieldk_E = fieldk_zel + b1 * fieldk_lin + fieldk_quad
             elif 'cubic' in self.model_name:
                 b1 = biases[0]
                 b2 = biases[1]
@@ -307,17 +425,24 @@ class Forward_Model:
                 bGamma3 = biases[3]
                 pk_lin = vals[0]
                 pddk_E, p1Gamma3k_E, p1S3k_E = self.transfer_function(pk_lin)
-                p1Gamma3k_E /= pddk_E
-                p1S3k_E /= pddk_E
+                p1Gamma3k_E = p1Gamma3k_E/pddk_E
+                p1S3k_E = p1S3k_E/pddk_E
                 d2r_L = self.d2r(delr_L)
                 G2r_L = self.G2r(delk_L)
-                if 'cs2' in self.model_name:
+                if 'cs2' in self.model_name and 'c1' in self.model_name and 'c2' in self.model_name:
                     cs2 = biases[4]
-                    fieldk_E += ( b1 + cs2*self.k2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
-                    if 'c1' in self.model_name:
-                        c1 = biases[5]
-                        fieldk_E += ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
+                    c1 = biases[5]
+                    c2 = biases[6]
+                    fieldk_E = fieldk_E + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + c1*self.k2_E*self.mu2_E*self.mu2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(0.5*b2*d2r_L +  bG2*G2r_L, pos_x)
+                elif 'cs2' in self.model_name and 'c1' in self.model_name:
+                    cs2 = biases[4]
+                    c1 = biases[5]
+                    fieldk_E = fieldk_E + ( b1 + cs2*self.k2_E + c1*self.k2_E*self.mu2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(0.5*b2*d2r_L +  bG2*G2r_L, pos_x)
+                elif 'cs2' in self.model_name:
+                    cs2 = biases[4]
+                    fieldk_E = fieldk_E + ( b1 + cs2*self.k2_E + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(0.5*b2*d2r_L +  bG2*G2r_L, pos_x)
                 else:
-                    fieldk_E += ( b1 + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(b2*d2r_L +  bG2*G2r_L, pos_x)
-
+                    fieldk_E = fieldk_E + ( b1 + bGamma3*p1Gamma3k_E + b1*p1S3k_E ) * self.L2E(delr_L, pos_x) + self.L2E(0.5*b2*d2r_L +  bG2*G2r_L, pos_x)
+            else:
+                fieldk_E = fieldk_zel
         return fieldk_E

@@ -80,20 +80,20 @@ def rfftn_tide(kvec):
     tide = tide.at[:,:,0,0,0].set(0.0)
     return tide
 
-def rfftn_G2(kvec):
+def rfftn_G1(kvec):
     k2 = rfftn_k2(kvec)
     k2 = k2.at[0,0,0].set(1.0)
-    G2_00 = kvec[0] * kvec[0] / k2
-    G2_10 = kvec[1] * kvec[0] / k2
-    G2_20 = kvec[2] * kvec[0] / k2
-    G2_11 = kvec[1] * kvec[1] / k2
-    G2_21 = kvec[2] * kvec[1] / k2 
-    G2_22 = kvec[2] * kvec[2] / k2
-    G2 = jnp.array([G2_00, G2_10, G2_20, G2_11, G2_21, G2_22])
+    G1_00 = kvec[0] * kvec[0] / k2
+    G1_01 = kvec[0] * kvec[1] / k2
+    G1_02 = kvec[0] * kvec[2] / k2
+    G1_11 = kvec[1] * kvec[1] / k2
+    G1_12 = kvec[1] * kvec[2] / k2 
+    G1_22 = kvec[2] * kvec[2] / k2
+    G1 = jnp.array([G1_00, G1_01, G1_02, G1_11, G1_12, G1_22])
     #G2 = kvec[:, None] * kvec[None] / k2
     #G2 = G2.at[:,:,0,0,0].set(0.0)
-    G2 = G2.at[:,0,0,0].set(0.0)
-    return G2
+    G1 = G1.at[:,0,0,0].set(0.0)
+    return G1
 
 def rfftn_Gauss(kvec, R):
     k2 = rfftn_k2(kvec)

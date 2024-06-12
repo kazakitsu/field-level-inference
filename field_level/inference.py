@@ -263,15 +263,15 @@ def field_inference(boxsize, redshift, which_pk,
         
         if 'cosmo' in which_pk:
             if 'oc' in cosmo_params.keys():
-                #scaled_oc = numpyro.sample('scaled_oc', dist.Uniform(0.0, 1.0))
-                omega_c = numpyro.sample('oc', dist.Uniform(0.05, 0.355))
-                #omega_c = numpyro.deterministic('oc', 0.05 + (0.355 - 0.05)*scaled_oc)
+                scaled_oc = numpyro.sample('scaled_oc', dist.Uniform(0.0, 1.0))
+                #omega_c = numpyro.sample('oc', dist.Uniform(0.05, 0.355))
+                omega_c = numpyro.deterministic('oc', 0.05 + (0.355 - 0.05)*scaled_oc)
             else:
                 omega_c = 0.11933
             if 'hubble' in cosmo_params.keys():
-                #scaled_h = numpyro.sample('scaled_hubble', dist.Uniform(0.0, 1.0))
-                hubble = numpyro.sample('hubble', dist.Uniform(0.64, 0.82))
-                #hubble = numpyro.deterministic('hubble', 0.64 + (0.82 - 0.64)*scaled_h)
+                scaled_h = numpyro.sample('scaled_hubble', dist.Uniform(0.0, 1.0))
+                #hubble = numpyro.sample('hubble', dist.Uniform(0.64, 0.82))
+                hubble = numpyro.deterministic('hubble', 0.64 + (0.82 - 0.64)*scaled_h)
                 H0 = numpyro.deterministic('H0', hubble*100)
             else:
                 hubble = 0.73
@@ -289,7 +289,9 @@ def field_inference(boxsize, redshift, which_pk,
                                             0.0])  ### z=0.0 for the sigma8 computation
             if 'sigma8' in cosmo_params.keys():
                 true_sigma8 = cosmo_params['sigma8']
-                sigma8 = numpyro.sample('sigma8', dist.Uniform(true_sigma8*0.5, true_sigma8*1.5))
+                scaled_sigma8 = numpyro.sample('scaled_sigma8', dist.Uniform(0.0, 1.0))
+                sigma8 = numpyro.deterministic('sigma8', true_sigma8*0.5 + (true_sigma8*1.5 - true_sigma8*0.5)*scaled_sigma8)
+                #sigma8 = numpyro.sample('sigma8', dist.Uniform(true_sigma8*0.5, true_sigma8*1.5))
                 pk_lin = f_model.linear_power(cosmo_params_local)
                 tmp_sigma8 = f_model.sigma8(pk_lin, type_integ='trap')
                 A = numpyro.deterministic('A', sigma8/tmp_sigma8)
@@ -350,6 +352,11 @@ def field_inference(boxsize, redshift, which_pk,
             c1 = numpyro.sample('c1', dist.Normal(true_c1, 20.))
         else:
             c1 = 0.0
+        if 'c2' in bias_params.keys():
+            true_c2 = bias_params['c2']
+            c2 = numpyro.sample('c2', dist.Normal(true_c2, 20.))
+        else:
+            c2 = 0.0
             
         if 'Sigma2' in bias_params.keys():
             true_Sigma2 = bias_params['Sigma2']
@@ -375,6 +382,8 @@ def field_inference(boxsize, redshift, which_pk,
             biases += [cs2,]
         if 'c1' in model_name:
             biases += [c1, ]
+        if 'c2' in model_name:
+            biases += [c2, ]
         if 'Sigma2' in model_name:
             biases += [Sigma2,]
         if 'Sigma2_mu2' in model_name:
@@ -385,14 +394,14 @@ def field_inference(boxsize, redshift, which_pk,
             biases += [growth_f]
         
         ### err model
-        if 'log_Perr' in err_params.keys():
+        if 'log_Perr' in err_params.keys(): 
             #true_log_Perr = jnp.log(true_Perr)
             true_log_Perr = err_params['log_Perr']
             true_Perr = jnp.exp(true_log_Perr)
             log_Perr = numpyro.sample("log_Perr", dist.Normal(true_log_Perr, 0.5))
             Perr = jnp.exp(log_Perr)
-            ratio_err = Perr/true_Perr
-            Pres = numpyro.deterministic("Pres", ratio_err - 1.0)
+            #ratio_err = Perr/true_Perr
+            #Pres = numpyro.deterministic("Pres", ratio_err - 1.0)
         else:
             Perr = jnp.exp(fixed_log_Perr)
         if 'log_Perr_k2mu2' in err_params.keys():
@@ -400,12 +409,12 @@ def field_inference(boxsize, redshift, which_pk,
             log_Perr_k2mu2 = numpyro.sample("log_Perr_k2mu2", dist.Normal(true_log_Perr_k2mu2, 0.5))
             Perr_k2mu2 = jnp.exp(log_Perr_k2mu2)
             ratio_ani = numpyro.deterministic("ratio_ani", Perr_k2mu2/Perr)
-            Perr += Perr*Perr_k2mu2*k2_1d_ind*mu2_1d_ind/(k_NL*k_NL)
+            Perr = Perr + Perr*Perr_k2mu2*k2_1d_ind*mu2_1d_ind/(k_NL*k_NL)
             
         if 'Perr_k2'in err_params.keys():
             true_Perr_k2 = err_params['Perr_k2']
             Perr_k2 = numpyro.sample("Perr_k2", dist.Normal(0., 20.0))
-            Perr += Perr*Perr_k2*k2_1d_ind
+            Perr = Perr + Perr*Perr_k2*k2_1d_ind
             
         sigma_err = jnp.sqrt(Perr/(2.*vol))
 
@@ -425,7 +434,7 @@ def field_inference(boxsize, redshift, which_pk,
             
         if 'b1_noise' in model_name:            
             gauss_1d_e = numpyro.sample("gauss_1d_e", dist.Normal(0.0, 1.0), sample_shape=(ng_e**3,))
-            gauss_1d_e *= sigma_eded
+            gauss_1d_e = gauss_1d_e * sigma_eded
             gauss_1d_e_re, gauss_1d_e_im = coord.gauss_to_delta(gauss_1d_e, ng_e)
             gauss_3d_e = gauss_1d_e_re.reshape(ng_e, ng_e, int(ng_e/2)+1) + 1j*gauss_1d_e_im.reshape(ng_e, ng_e, int(ng_e/2)+1)
             gauss_3d_e = gauss_3d_e.at[0,0,0].set(0.0)
@@ -448,9 +457,9 @@ def field_inference(boxsize, redshift, which_pk,
             fieldk_model_E = f_model.models(delk_L, biases)
                                     
         if 'Sigma2_mu2' in model_name:
-            fieldk_model_E *= jnp.exp(-0.5*Sigma2_mu2*k2_E*mu2_E)
+            fieldk_model_E = fieldk_model_E * jnp.exp(-0.5*Sigma2_mu2*k2_E*mu2_E)
         if 'Sigma2' in model_name:
-            fieldk_model_E *= jnp.exp(-0.5*Sigma2*k2_E)
+            fieldk_model_E = fieldk_model_E * jnp.exp(-0.5*Sigma2*k2_E)
 
         if kmax > 1.0:
             fieldk_model = coord.reduce_deltak(ng_max, fieldk_model_E)
@@ -562,6 +571,7 @@ def field_inference(boxsize, redshift, which_pk,
             min_pe_samples[param] = np.loadtxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat')
     #elif i_chain > 0 :
     #    rng_key = jax.random.PRNGKey(0)
+    #    n_warmup = 2
     #    mcmc.warmup(rng_key, deltak_data=datak_1d_ind, extra_fields=('potential_energy',))
     #    print(f'Loading post warmup state from {save_base}_0_{mcmc_seed}_warmup_state.pkl ...', file=sys.stderr)
     #    with open(f'{save_base}_0_{mcmc_seed}_warmup_state.pkl', 'rb') as f:
@@ -570,12 +580,13 @@ def field_inference(boxsize, redshift, which_pk,
     #    mcmc._last_state = warmup_state
     #    print('LOADED warmup state = ', file=sys.stderr)
     #    print(mcmc.post_warmup_state, file=sys.stderr)
-    #    print('LOADED last state = ', file=sys.stderr)
+    #    print('LOADE1D last state = ', file=sys.stderr)
     #    print(mcmc.last_state, file=sys.stderr)
     elif n_warmup == 1:
+        mcmc_seed += 12345*i_chain
         rng_key = jax.random.PRNGKey(0)
         mcmc.warmup(rng_key, deltak_data=datak_1d_ind, extra_fields=('potential_energy',))
-        print(f'Loading post warmup state from {save_base}_0_{mcmc_seed}_warmup_state.pkl ...', file=sys.stderr)
+        print(f'Loading post warmup state from {save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl ...', file=sys.stderr)
         with open(f'{save_base}_0_{mcmc_seed}_warmup_state.pkl', 'rb') as f:
             warmup_state = pickle.load(f)
         mcmc.post_warmup_state = warmup_state
@@ -595,19 +606,42 @@ def field_inference(boxsize, redshift, which_pk,
         print(inv_mass_matrix, file=sys.stderr)
         print('i_warmup = ', i_warmup, file=sys.stderr)
        
-        criteria = 1.0
+        criteria = 0.9
         
-        if which_ics=='varied_ics':
-            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
+        while_check = 0
+        
+        if 'A' in dense_mass:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+        
+        if 'A' in dense_mass and 'scaled_oc' in dense_mass and 'scaled_hubble' in dense_mass:
+            num_cosmo_params = 3
+        elif 'A' in dense_mass and 'scaled_oc' in dense_mass:
+            num_cosmo_params = 2
+        elif 'scaled_oc' in dense_mass and 'scaled_hubble' in dense_mass:
+            num_cosmo_params = 2
+        elif 'scaled_hubble' in dense_mass and 'A' in dense_mass:
+            num_cosmo_params = 2
+        elif 'A' in dense_mass or 'scaled_oc' in dense_mass or 'scaled_hubble' in dense_mass:
+            num_cosmo_params = 1
         else:
-            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+            num_cosmo_params = 0
             
-        print('while = ', while_test, file=sys.stderr)
+        num_bias_params = 0
+        if 'b1' in dense_mass:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params]) > criteria)
+            num_bias_params += 1
+        if 'b2' in dense_mass:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+            num_bias_params += 1
+        if 'bG2' in dense_mass:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+
+        print('while = ', while_check, file=sys.stderr)
         
         with open(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
             pickle.dump(mcmc.post_warmup_state, f)
         
-        while( while_test ):
+        while( while_check > 0 ):
             rng_key = jax.random.PRNGKey(mcmc_seed+i_warmup)
             print('rng_seed = ',mcmc_seed+i_warmup, file=sys.stderr)
             print('rng key = ', rng_key, file=sys.stderr)
@@ -616,8 +650,21 @@ def field_inference(boxsize, redshift, which_pk,
             i_warmup += 1
             print(inv_mass_matrix, file=sys.stderr)
             
-            while_test = (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria) or (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
-            print('while = ', while_test, file=sys.stderr)
+            while_check = 0
+        
+            if 'A' in dense_mass:
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+            num_bias_params = 0
+            if 'b1' in dense_mass:
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params]) > criteria)
+                num_bias_params += 1
+            if 'b2' in dense_mass:
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+                num_bias_params += 1
+            if 'bG2' in dense_mass:
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+
+            print('while = ', while_check, file=sys.stderr)
             
             print('i_warmup = ', i_warmup, file=sys.stderr)
         
@@ -713,5 +760,7 @@ def field_inference(boxsize, redshift, which_pk,
         else:
             np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat', np.array([min_pe_samples[param]]))
 
+    if i_contd > 0:
+        os.remove(f'{save_base}_{i_chain}_{i_contd}_last_state.pkd')
     if i_chain > 0:
         os.remove(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl')

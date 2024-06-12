@@ -71,11 +71,10 @@ def power_compute(fieldk_1, fieldk_2, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell=
     Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
     Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
 
-    bmax = jnp.digitize(kmax, k_arr, right=True)
-    k  = k[1:bmax+1]
-    Pk = Pk[1:bmax+1]
-    Nk = Nk[1:bmax+1]
-    k_arr = k_arr[:bmax+1]
+    k  = k[1:nbin+1]
+    Pk = Pk[1:nbin+1]
+    Nk = Nk[1:nbin+1]
+    k_arr = k_arr[:nbin+1]
     
     k /= Nk
     Pk /= Nk
@@ -137,10 +136,9 @@ def window_legendre_compute(fieldk, boxsize, nbin=60, kmin=0.0, kmax=0.6, ellmax
             Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
             Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
             
-            bmax = jnp.digitize(kmax, k_arr, right=True)
-            k  = k[1:bmax+1]
-            Pk = Pk[1:bmax+1]
-            Nk = Nk[1:bmax+1]
+            k  = k[1:nbin+1]
+            Pk = Pk[1:nbin+1]
+            Nk = Nk[1:nbin+1]
             
             k /= Nk
             Pk /= Nk
@@ -160,7 +158,7 @@ def covariance_legendre_compute(pk_3d, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell
     k_arr = jnp.linspace(kmin, kmax, nbin+1)
     
     ### Set the appropriate Nk for each k
-    Nk_base = jnp.full_like(pk_3d, 2, dtype=jnp.int32)
+    Nk_base = jnp.full_like(pk_3d, 2, dtype=jnp.int64)
     Nk_base = Nk_base.at[..., 0].set(1)
     if pk_3d.shape[-1] % 2 == 0:
         Nk_base = Nk_base.at[..., -1].set(1)
@@ -200,9 +198,8 @@ def covariance_legendre_compute(pk_3d, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell
             Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
             Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
             
-            bmax = jnp.digitize(kmax, k_arr, right=True)
-            Pk = Pk[1:bmax+1]
-            Nk = Nk[1:bmax+1]
+            Pk = Pk[1:nbin+1]
+            Nk = Nk[1:nbin+1]
             
             Pk /= Nk**2
             Pk *= 2.0
@@ -213,9 +210,8 @@ def covariance_legendre_compute(pk_3d, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell
     return cov
 
 @partial(jit, static_argnums=(3, 4, 5, 6))
-def power_weight_compute(pk, k_3d, mu2_3d, nbin=60, kmin=0.0, kmax=0.6, ellmax=4):
-    ### pk = [k, Pk]
-    pk_3d = jnp.interp(k_3d, pk[0], pk[1])
+def power_weight_compute(pk_3d, k_3d, mu2_3d, nbin=60, kmin=0.0, kmax=0.6, ellmax=4):
+    #pk_3d = jnp.interp(k_3d, pk[0], pk[1])
     nell = int(ellmax/2) + 1
 
     k_arr = jnp.linspace(kmin, kmax, nbin+1)

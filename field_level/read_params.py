@@ -60,7 +60,15 @@ def read_params(params_file):
                 if len(dense_mass_elements) > 1:
                     dense_mass = []
                     for i in range(len(dense_mass_elements)-1):
-                        dense_mass.append(dense_mass_elements[i+1])
+                        if dense_mass_elements[i+1] == 'sigma8':
+                            tmp = 'scaled_sigma8'
+                        elif dense_mass_elements[i+1] == 'oc':
+                            tmp = 'scaled_oc'
+                        elif dense_mass_elements[i+1] == 'hubble':
+                            tmp = 'scaled_hubble'
+                        else:
+                            tmp = dense_mass_elements[i+1]
+                        dense_mass.append(tmp)
                     dense_mass = [tuple(dense_mass)]
             elif 'A' in line:
                 (idx, value) = line.split()
@@ -90,6 +98,9 @@ def read_params(params_file):
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'c1' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
+            elif 'c2' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'Sigma2' in line:
