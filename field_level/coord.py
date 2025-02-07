@@ -15,42 +15,25 @@ def deconvolve(nvec, window_order):
     wk = window**window_order
     return wk
 
-def rfftn_kvec(shape, boxsize, dtype=float):
-    """wavevectors for `numpy.fft.rfftn`
-    """
-    kvec = []
-    for axis, n in enumerate(shape[:-1]):
-        k = jnp.fft.fftfreq(n,d=1./shape[-1]).astype(dtype)
-        kvec.append(k)
-
-    k = jnp.fft.rfftfreq(shape[-1],d=1./shape[-1]).astype(dtype)
-    kvec.append(k)
-
+def rfftn_kvec(shape, boxsize, dtype=jnp.float32):
+    """Generate wavevectors for `jax.numpy.fft.rfftn`"""
+    kvec = [jnp.fft.fftfreq(n, d=boxsize/n).astype(dtype) for n in shape[:-1]]
+    kvec.append(jnp.fft.rfftfreq(shape[-1], d=boxsize/shape[-1]).astype(dtype))
     kvec = jnp.meshgrid(*kvec, indexing='ij')
     kvec = jnp.stack(kvec, axis=0)
-
-    kvec *= 2*jnp.pi / boxsize
-
-    return kvec
+    return kvec * (2 * jnp.pi / boxsize)
 
 def rfftn_khat(shape, dtype=float):
-    """unit wavevectors for `numpy.fft.rfftn`
+    """unit wavevectors for `jax.numpy.fft.rfftn`
     """
-    kvec = []
-    for axis, n in enumerate(shape[:-1]):
-        k = jnp.fft.fftfreq(n,d=1./shape[-1]).astype(dtype)
-        kvec.append(k)
-
-    k = jnp.fft.rfftfreq(shape[-1],d=1./shape[-1]).astype(dtype)
-    kvec.append(k)
-
+    kvec = [jnp.fft.fftfreq(n, d=1./n).astype(dtype) for n in shape[:-1]]
+    kvec.append(jnp.fft.rfftfreq(shape[-1], d=1./shape[-1]).astype(dtype))
     kvec = jnp.meshgrid(*kvec, indexing='ij')
     kvec = jnp.stack(kvec, axis=0)
 
     kmag = (kvec ** 2).sum(axis=0)
     kmag = jnp.sqrt(kmag)
 
-    #kmag.at[0,0,0].set(1.0)
     kmag = kmag.at[0,0,0].set(1.0)
     kvec = kvec / kmag
 

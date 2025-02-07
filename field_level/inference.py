@@ -110,14 +110,18 @@ def field_inference(boxsize, redshift, which_pk,
     dense_mass : [tuple]
         The parameters whose mass matrix is full-rank.
         
-    mcmc_params : (int, int, int, int, float, int, int)
-        (i-th chain, thinning, # of samples, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) )
+    mcmc_params : (int, int, int, int, float, int, int) or (int, int, int, int, float, int, int, int)
+        (i-th chain, thinning, # of samples, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) ), + (if i-th chain < 0, the # of chains for parallel sampling)
 
     """
     which_ics, collect_ics = ics_params
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
-    i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
+    if i_chain >= 0:
+        i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
+        n_chains = 1
+    else:
+        i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd, n_chains = mcmc_params
     if i_contd > 0:
         n_warmup = 1
     if 'fixed_log_Perr' in err_params.keys():
@@ -604,9 +608,10 @@ def field_inference(boxsize, redshift, which_pk,
     mcmc = numpyro.infer.MCMC(kernel,
                               num_samples=i_sample,
                               num_warmup=n_warmup,
-                              num_chains=1,
+                              num_chains=n_chains,
                               thinning=thin,
-                              chain_method="sequential",
+                              #chain_method="sequential",
+                              chain_method="parallel",
                               progress_bar=False)
     
     posterior_samples = {}
