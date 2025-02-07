@@ -1,13 +1,14 @@
 # !/usr/bin/env python3
 
-import numpy as np
-import jax.numpy as jnp
-from jax import jit
-from functools import partial
 import sys
 import jax
 
 jax.config.update("jax_enable_x64", True)
+
+import numpy as np
+import jax.numpy as jnp
+from jax import jit, lax
+from functools import partial
 
 import field_level.coord as coord
 
@@ -24,6 +25,7 @@ def assign(boxsize, field, weight, pos, window_order, interlace=0, contd=0):
         num = ng_p*ng_p*ng_p
     ng3 = ng*ng*ng
     pos_mesh = pos.astype(float)/cell_size
+    
     if interlace==1:
         pos_mesh += 0.5
     ###NGP
@@ -35,7 +37,7 @@ def assign(boxsize, field, weight, pos, window_order, interlace=0, contd=0):
         
         field = field.at[imesh[0], imesh[1], imesh[2]].add( weight )
     ###CIC
-    elif window_order==2:
+    elif window_order == 2:
         ### somehow the following commented code is not working for the inference with the quad bias operatiors...
         '''
         num_neighbors = window_order**3 ### in 3d space
@@ -57,16 +59,21 @@ def assign(boxsize, field, weight, pos, window_order, interlace=0, contd=0):
             neighbor_weight = weight * jnp.prod(jnp.where(neighbor > 0, fmesh, 1. - fmesh), axis=0)
             field = field.at[neighbor_mesh[0], neighbor_mesh[1], neighbor_mesh[2]].add(neighbor_weight)
         '''
-        imesh = jnp.floor(pos_mesh).astype(np.int32)
-        fmesh = jnp.subtract(pos_mesh, imesh)
+        imesh = jnp.floor(pos_mesh).astype(jnp.int32)
+        fmesh = pos_mesh - imesh
 
-        imesh = jnp.where( imesh < ng, imesh, imesh-ng )
-        imesh = jnp.where( imesh >= 0, imesh, imesh+ng )
+        #imesh = jnp.where( imesh < ng, imesh, imesh-ng )
+        #imesh = jnp.where( imesh >= 0, imesh, imesh+ng )
 
-        ipmesh = imesh + 1
-        ipmesh = jnp.where( ipmesh < ng, ipmesh, ipmesh-ng )
+        #ipmesh = imesh + 1
+        #ipmesh = jnp.where( ipmesh < ng, ipmesh, ipmesh-ng )
 
-        tmesh = jnp.subtract(1.0, fmesh)
+        #tmesh = jnp.subtract(1.0, fmesh)
+
+        imesh = imesh % ng
+        ipmesh = (imesh + 1) % ng
+
+        tmesh = 1.0 - fmesh
         
         field = field.at[imesh[0], imesh[1], imesh[2]].add( weight*tmesh[0]*tmesh[1]*tmesh[2] )
 
@@ -78,7 +85,8 @@ def assign(boxsize, field, weight, pos, window_order, interlace=0, contd=0):
         field = field.at[imesh[0], ipmesh[1], ipmesh[2]].add( weight*tmesh[0]*fmesh[1]*fmesh[2] )
         field = field.at[ipmesh[0], imesh[1], ipmesh[2]].add( weight*fmesh[0]*tmesh[1]*fmesh[2] )
 
-        field = field.at[ipmesh[0], ipmesh[1], ipmesh[2]].add( weight*fmesh[0]*fmesh[1]*fmesh[2] )        
+        field = field.at[ipmesh[0], ipmesh[1], ipmesh[2]].add( weight*fmesh[0]*fmesh[1]*fmesh[2] )
+
     ###TSC
     elif window_order==3:
         ### somehow the following commented code is not working for the inference with the quad bias operatiors...
@@ -110,7 +118,7 @@ def assign(boxsize, field, weight, pos, window_order, interlace=0, contd=0):
                                    axis=0)
             field = field.at[neighbor_mesh[0], neighbor_mesh[1], neighbor_mesh[2]].add(w * weight)
         '''
-        imesh = jnp.floor(pos_mesh-1.5).astype(np.int32) + 2
+        imesh = jnp.floor(pos_mesh-1.5).astype(jnp.int32) + 2
         fmesh = jnp.subtract(pos_mesh, imesh)
 
         imesh = jnp.where( imesh < ng, imesh, imesh-ng )

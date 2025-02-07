@@ -66,6 +66,8 @@ def read_params(params_file):
                             tmp = 'scaled_oc'
                         elif dense_mass_elements[i+1] == 'hubble':
                             tmp = 'scaled_hubble'
+                        elif dense_mass_elements[i+1] == 'Peed':
+                            tmp = 'scaled_Peed'
                         else:
                             tmp = dense_mass_elements[i+1]
                         dense_mass.append(tmp)
@@ -122,6 +124,15 @@ def read_params(params_file):
                 (idx, value) = line.split()
                 err_params[idx] = float(value)
             elif 'log_Peded' in line:
+                (idx, value) = line.split()
+                err_params[idx] = float(value)
+            elif 'fixed_log_Peded' in line:
+                (idx, value) = line.split()
+                err_params[idx] = float(value)
+            elif 'Peed' in line:
+                (idx, value) = line.split()
+                err_params[idx] = float(value)
+            elif 'fixed_Peed' in line:
                 (idx, value) = line.split()
                 err_params[idx] = float(value)
             elif 'kmax' in line:

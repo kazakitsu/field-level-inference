@@ -1,11 +1,13 @@
 # !/usr/bin/env python3
 
+import sys
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 from jax import jit
 from functools import partial
 
-import jax
-jax.config.update("jax_enable_x64", True)
 
 def deconvolve(nvec, window_order):
     ng = nvec.shape[1]
@@ -68,6 +70,7 @@ def rfftn_disp(kvec):
 
 def rfftn_nabla(kvec):
     nabla = 1j * kvec
+    #nabla = kvec
     return nabla
 
 def rfftn_tide(kvec):
@@ -83,13 +86,13 @@ def rfftn_tide(kvec):
 def rfftn_G1(kvec):
     k2 = rfftn_k2(kvec)
     k2 = k2.at[0,0,0].set(1.0)
-    G1_00 = kvec[0] * kvec[0] / k2
-    G1_01 = kvec[0] * kvec[1] / k2
-    G1_02 = kvec[0] * kvec[2] / k2
-    G1_11 = kvec[1] * kvec[1] / k2
-    G1_12 = kvec[1] * kvec[2] / k2 
-    G1_22 = kvec[2] * kvec[2] / k2
-    G1 = jnp.array([G1_00, G1_01, G1_02, G1_11, G1_12, G1_22])
+    G1 = jnp.zeros((6,) + k2.shape, dtype=kvec.dtype)
+    G1 = G1.at[0].set(kvec[0] * kvec[0] / k2)  # G1_00
+    G1 = G1.at[1].set(kvec[0] * kvec[1] / k2)  # G1_01
+    G1 = G1.at[2].set(kvec[0] * kvec[2] / k2)  # G1_02
+    G1 = G1.at[3].set(kvec[1] * kvec[1] / k2)  # G1_11
+    G1 = G1.at[4].set(kvec[1] * kvec[2] / k2)  # G1_12
+    G1 = G1.at[5].set(kvec[2] * kvec[2] / k2)  # G1_22
     #G2 = kvec[:, None] * kvec[None] / k2
     #G2 = G2.at[:,:,0,0,0].set(0.0)
     G1 = G1.at[:,0,0,0].set(0.0)
@@ -118,10 +121,10 @@ def indep_coord(ng):
     ### c = 0 plane
     coord_czero_real = jnp.array([0, coord_func(ng,ngo2,0,0), coord_func(ng,0,ngo2,0), coord_func(ng,ngo2,ngo2,0)])
     
-    coord_czero_azero_bhalf = jnp.arange(coord_func(ng,0,1,0), coord_func(ng,0,ngo2-1,0)+1, ngo2+1, dtype='int')
+    coord_czero_azero_bhalf = jnp.arange(coord_func(ng,0,1,0), coord_func(ng,0,ngo2-1,0)+1, ngo2+1, dtype=jnp.uint32)
     coord_czero_azero_bhalf_conj = ng2o2 + ng - coord_czero_azero_bhalf
 
-    coord_czero_ahalf_bzero = jnp.arange(coord_func(ng,1,0,0), coord_func(ng,ngo2-1,0,0)+1, ng2o2+ng, dtype='int')
+    coord_czero_ahalf_bzero = jnp.arange(coord_func(ng,1,0,0), coord_func(ng,ngo2-1,0,0)+1, ng2o2+ng, dtype=jnp.uint32)
     coord_czero_ahalf_bzero_conj = ng3o2 + ng2 - coord_czero_ahalf_bzero
 
     coord_czero_ahalf_bngo2 = coord_czero_ahalf_bzero + int(ng2o2/2) + ngo2
