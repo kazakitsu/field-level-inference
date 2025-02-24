@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 
 import sys
-import field_level.inference as inference
-import field_level.read_params as read_params
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("params_file", type=str, help="Path to the parameter file")
+    parser.add_argument("--enable-x64", action="store_true", help="Enable 64-bit mode in JAX", default=False)
+    return parser.parse_args()
 
 if __name__ == '__main__':
-    args = sys.argv
-    params_file = args[1]
+    args = parse_args()
+
+    params_file = args.params_file
+    enable_x64 = args.enable_x64
+
+    import jax
+    if enable_x64:
+        jax.config.update("jax_enable_x64", True)
+
+    import field_level.read_params as read_params
+    import field_level.inference as inference
     
     params_dict = read_params.read_params(params_file)
     
