@@ -1,32 +1,29 @@
 # !/usr/bin/env python3
-import numpy as np
-import jax.numpy as jnp
-import numpyro
-import numpyro.distributions as dist
-from jax import random
-from numpyro.infer import MCMC, NUTS
-import jax
-import jax.scipy as jsp
-from jax import jit
-from functools import partial
 import os
 import sys
-import matplotlib.pyplot as plt
+import numpy as np
+
+import jax
+import numpyro
+if jax.config.read('jax_enable_x64'):
+    numpyro.enable_x64()
+    print('NumPyro x64 mode is enabled because JAX is in x64 mode.', file=sys.stderr)
+
+import jax.numpy as jnp
+from jax import random
+import jax.scipy as jsp
+from jax import jit
+from numpyro.infer import MCMC, NUTS
+import numpyro.distributions as dist
+from functools import partial
 import pickle
 import time
-
-from field_level.JAX_Zenbu import Zenbu
-from field_level.Zenbu_utils.loginterp_jax import loginterp_jax
 
 import field_level.coord as coord
 import field_level.forward_model as forward_model
 import field_level.util as utiil
 import field_level.cosmo_util as cosmo_util
 
-import jax
-jax.config.update("jax_enable_x64", True)
-
-numpyro.enable_x64()
 print('The inference is running on', jax.default_backend(), file=sys.stderr)
 cpus = jax.devices("cpu")
 
@@ -36,7 +33,8 @@ def field_inference(boxsize, redshift, which_pk,
                     cosmo_params, bias_params, err_params, kmax, 
                     dense_mass, mcmc_params,
                     **kwargs):
-    """ Field-level inference with numpyro NUTS
+    """ 
+    Field-level inference with numpyro NUTS
 
     Parameters
     ----------
@@ -93,8 +91,9 @@ def field_inference(boxsize, redshift, which_pk,
             'b2': the bias to \delta^2
             'bG2': the bias to G2
             'bGamma3': the bias to Gamma3
-            'cs2': the coefficient to k^2 \delta
-            'c1' : the coefficient to k^2 \mu^2 \delta
+            'c0': the coefficient to k^2 \delta
+            'c2' : the coefficient to k^2 \mu^2 \delta
+            'c4' : the coefficient to k^2 \mu^4 \delta
             'Sigma2': the coefficient in exp(-0.5 k^2 \Sigma2)
             'Sigma2_mu2' : the coefficient in exp(-0.5 k^2 \mu^2 \Sigma2)
 
@@ -110,18 +109,17 @@ def field_inference(boxsize, redshift, which_pk,
     dense_mass : [tuple]
         The parameters whose mass matrix is full-rank.
         
-    mcmc_params : (int, int, int, int, float, int, int) or (int, int, int, int, float, int, int, int)
-        (i-th chain, thinning, # of samples, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) ), + (if i-th chain < 0, the # of chains for parallel sampling)
+    mcmc_params : (int, int, int, int, int, float, int, int)
+        (i-th chain, thinning, # of samples, # of chains, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) )
+        # of chains can be greater than 1 only if i-th chain < 0.
 
     """
     which_ics, collect_ics = ics_params
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
-    if i_chain >= 0:
-        i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
-        n_chains = 1
-    else:
-        i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd, n_chains = mcmc_params
+    i_chain, thin, n_samples, n_chains, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
+    if n_chains > 1 and i_chain >= 0:
+        raise ValueError('i_chain must be negative if n_chains > 1')
     if i_contd > 0:
         n_warmup = 1
     if 'fixed_log_Perr' in err_params.keys():
@@ -182,19 +180,6 @@ def field_inference(boxsize, redshift, which_pk,
     ### get the linear power spectrum
     linear_pk = f_model.linear_power(cosmo_params_tmp)
     
-    ### call Zenbu to compute the transfer function
-    if 'cubic' in model_name:
-        print('test computation for cubic spectra', file=sys.stderr)
-        f_model.call_Zenbu(cosmo_params_tmp, kmax)
-        t1 = time.time()
-        ptable_tmp = f_model.transfer_function(cosmo_params_tmp, 0.9*linear_pk[1])
-        t2 = time.time()
-        print(t2-t1, file=sys.stderr)
-        t1 = time.time()
-        ptable_tmp = f_model.transfer_function(cosmo_params_tmp, 1.1*linear_pk[1])
-        t2 = time.time()
-        print(t2-t1, file=sys.stderr)
-
     ### find indeces of independent modes
     if which_space == 'k_space':
         if kmax > 1.0:
@@ -239,11 +224,11 @@ def field_inference(boxsize, redshift, which_pk,
     if which_space == 'k_space':
         data[0,0,0] = 0.0 ### subtracting the DC mode
         if kmax > 1.0:
-            data_max = coord.reduce_deltak(ng_max, data)
+            data_max = coord.func_reduce(ng_max, data)
             data_1d_ind = independent_modes(data_max)
         else:
             if ng < ng_E:
-                data_E = coord.reduce_deltak(ng, data)
+                data_E = coord.func_reduce(ng, data)
             elif ng > ng_E:
                 data_E = coord.func_extend(ng, data)
             else:
@@ -253,7 +238,7 @@ def field_inference(boxsize, redshift, which_pk,
         if data.shape[2] != data.shape[0]:
             print('data is in Fourier space.', file=sys.stderr)
             data[0,0,0] = 0.0 ### subtracting the DC mode
-            data_ = coord.reduce_deltak(ng_max, data)
+            data_ = coord.func_reduce(ng_max, data)
             datar = jnp.fft.irfftn(data_) * ng3_max
             data_1d_ind = datar.reshape(ng3_max)
         else:
@@ -263,22 +248,21 @@ def field_inference(boxsize, redshift, which_pk,
 
     print('data_1d_ind.shape = ', file=sys.stderr)
     print(data_1d_ind.shape, file=sys.stderr)
-
     
     ###k2 in 1d independent modes
     k_NL = 0.1
     if which_space == 'k_space':
         if kmax > 1.0:
-            kvec = coord.rfftn_kvec([ng_max, ng_max, ng_max], boxsize)
+            kvec = coord.rfftn_kvec([ng_max,]*3, boxsize)
         else:
-            kvec = coord.rfftn_kvec([ng, ng, ng], boxsize)
+            kvec = coord.rfftn_kvec([ng,]*3, boxsize)
         k2 = coord.rfftn_k2(kvec)
         mu2 = kvec[2]*kvec[2]/k2
         k2_1d_ind = independent_modes(k2)/(k_NL*k_NL) ###normalized by (k/k_NL)^2
         mu2_1d_ind = independent_modes(mu2) ###normalized by (k/k_NL)^2
     
     if 'Sigma2' in model_name:
-        kvec_E = coord.rfftn_kvec([ng_E, ng_E, ng_E], boxsize)
+        kvec_E = coord.rfftn_kvec([ng_E,]*3, boxsize)
         k2_E = coord.rfftn_k2(kvec_E)
         mu2_E = kvec_E[2]*kvec_E[2]/k2_E
         del kvec_E
@@ -287,8 +271,6 @@ def field_inference(boxsize, redshift, which_pk,
         if which_ics=='varied_ics':
             gauss_1d = numpyro.sample("gauss_1d", dist.Normal(0.0, 1.0), sample_shape=(ng3,))
             gauss_3d = coord.gauss_1d_to_3d(gauss_1d, ng)
-            #gauss_1d_re, gauss_1d_im = coord.gauss_to_delta(gauss_1d, ng)
-            #gauss_3d = gauss_1d_re.reshape(ng,ng,ngo2+1) + 1j*gauss_1d_im.reshape(ng,ng,ngo2+1)
         
         if 'cosmo' in which_pk:
             if 'oc' in cosmo_params.keys():
@@ -306,8 +288,8 @@ def field_inference(boxsize, redshift, which_pk,
                 hubble = 0.73
             #omega_b = numpyro.sample('ob', dist.Uniform(0.01875, 0.02625))
             omega_b = 0.02242
-            #ns = numpyro.sample('ns', dist.Uniform(0.84, 1.1))
             OM = numpyro.deterministic('OM', (omega_b + omega_c)/hubble/hubble)
+            #ns = numpyro.sample('ns', dist.Uniform(0.84, 1.1))
             ns = 0.9665
             ln1010As = 3.047
             cosmo_params_local = jnp.array([omega_b,
@@ -322,12 +304,12 @@ def field_inference(boxsize, redshift, which_pk,
                 sigma8 = numpyro.deterministic('sigma8', true_sigma8*0.5 + (true_sigma8*1.5 - true_sigma8*0.5)*scaled_sigma8)
                 #sigma8 = numpyro.sample('sigma8', dist.Uniform(true_sigma8*0.5, true_sigma8*1.5))
                 pk_lin = f_model.linear_power(cosmo_params_local)
-                tmp_sigma8 = f_model.sigma8(pk_lin, type_integ='trap')
+                tmp_sigma8 = f_model.sigmaR(pk_lin)
                 A = numpyro.deterministic('A', sigma8/tmp_sigma8)
             elif 'A' in cosmo_params.keys():
                 A = numpyro.sample('A', dist.Uniform(0.5, 1.5))
                 pk_lin = f_model.linear_power(cosmo_params_local)
-                sigma8 = numpyro.deterministic('sigma8', A * f_model.sigma8(pk_lin, type_integ='trap'))
+                sigma8 = numpyro.deterministic('sigma8', A * f_model.sigmaR(pk_lin))
             else:
                 A = 1.0
             cosmo_params_local = cosmo_params_local.at[-1].set(redshift)
@@ -342,51 +324,67 @@ def field_inference(boxsize, redshift, which_pk,
                 A = 1.0
             
         ### bias
-        if 'b1' in bias_params.keys():
+        if 'Ab1' in bias_params.keys():
+            true_Ab1 = bias_params['Ab1']
+            Ab1 = numpyro.sample('Ab1', dist.Uniform(true_Ab1-1, true_Ab1+2))
+            b1 = numpyro.deterministic('b1', Ab1/A)
+        elif 'b1' in bias_params.keys():
             true_b1 = bias_params['b1']
             b1 = numpyro.sample('b1', dist.Uniform(true_b1-1, true_b1+2))
         else:
             b1 = 1.0
         
-        if 'b2' in bias_params.keys():
+        if 'A2b2' in bias_params.keys():
+            true_A2b2 = bias_params['A2b2']
+            A2b2 = numpyro.sample('A2b2', dist.Normal(true_A2b2, 2.))
+            b2 = numpyro.deterministic('b2', A2b2/A/A)
+        elif 'b2' in bias_params.keys():
             true_b2 = bias_params['b2']
             b2 = numpyro.sample('b2', dist.Normal(true_b2, 2.))
         else:
             b2 = -0.5
             
-        if 'bG2' in bias_params.keys():
+        if 'A2bG2' in bias_params.keys():
+            true_A2bG2 = bias_params['A2bG2']
+            A2bG2 = numpyro.sample('A2bG2', dist.Normal(true_A2bG2, 2.))
+            bG2 = numpyro.deterministic('bG2', A2bG2/A/A)
+        elif 'bG2' in bias_params.keys():
             true_bG2 = bias_params['bG2']
             bG2 = numpyro.sample('bG2', dist.Normal(true_bG2, 2.))
         else:
             bG2 = -0.5
             
-        if 'bGamma3' in bias_params.keys():
+        if 'A3bGamma3' in bias_params.keys():
+            true_A3bGamma3 = bias_params['A3bGamma3']
+            A3bGamma3 = numpyro.sample('A2bG2', dist.Normal(true_A3bGamma3, 2.))
+            bGamma3 = numpyro.deterministic('bGamma3', dist.Normal(A3bGamma3/A/A/A, 2.))
+        elif 'bGamma3' in bias_params.keys():
             true_bGamma3 = bias_params['bGamma3']
             bGamma3 = numpyro.sample('bGamma3', dist.Normal(true_bGamma3, 2.))
         else:
             bGamma3 = -0.5
                     
         ### counter terms
-        if 'cs2' in bias_params.keys():
-            true_cs2 = bias_params['cs2']
-            cs2 = numpyro.sample('cs2', dist.Normal(true_cs2, 20.))
+        if 'c0' in bias_params.keys():
+            true_c0 = bias_params['c0']
+            c0 = numpyro.sample('c0', dist.Normal(true_c0, 20.))
         else:
             #cs2 = -1.2829 or -2.099673 for 1lpt_matter 
             #cs2 = -3.934091 for 1lpt_matter_lin 
             #cs2 = -3.342199 ### for 1lpt_matter_rsd_lin
             cs2 = -2.705611 ### for 1lpt_matter_rsd_quad
-        if 'c1' in bias_params.keys():
-            true_c1 = bias_params['c1']
-            c1 = numpyro.sample('c1', dist.Normal(true_c1, 20.))
-        else:
-            #c1 = -9.907751 ### for 1lpt_matter_rsd_lin
-            c1 = -11.00391 ### for 1lpt_matter_rsd_quad
         if 'c2' in bias_params.keys():
             true_c2 = bias_params['c2']
             c2 = numpyro.sample('c2', dist.Normal(true_c2, 20.))
         else:
+            #c1 = -9.907751 ### for 1lpt_matter_rsd_lin
+            c2 = -11.00391 ### for 1lpt_matter_rsd_quad
+        if 'c4' in bias_params.keys():
+            true_c4 = bias_params['c4']
+            c4 = numpyro.sample('c4', dist.Normal(true_c4, 20.))
+        else:
             #c2 = 4.668099 ### for 1lpt_matter_rsd_lin
-            c2 = 5.498273 ### for 1lpt_matter_rsd_quad
+            c4 = 5.498273 ### for 1lpt_matter_rsd_quad
             
         if 'Sigma2' in bias_params.keys():
             true_Sigma2 = bias_params['Sigma2']
@@ -399,7 +397,7 @@ def field_inference(boxsize, redshift, which_pk,
         else:
             Sigma2_mu2 = 0.0
         
-        if 'lin' in model_name or 'b1' in model_name or 'gauss_rsd' in model_name:
+        if 'lin' in model_name:
             biases = [b1,]
         elif 'quad' in model_name:
             biases = [b1, b2, bG2,]
@@ -408,12 +406,12 @@ def field_inference(boxsize, redshift, which_pk,
         else:
             biases = []
         
-        if 'cs2' in model_name:
-            biases += [cs2,]
-        if 'c1' in model_name:
-            biases += [c1, ]
+        if 'c0' in model_name:
+            biases += [c0,]
         if 'c2' in model_name:
             biases += [c2, ]
+        if 'c4' in model_name:
+            biases += [c4, ]
         if 'Sigma2' in model_name:
             biases += [Sigma2,]
         if 'Sigma2_mu2' in model_name:
@@ -430,7 +428,6 @@ def field_inference(boxsize, redshift, which_pk,
                 true_log_Perr = jnp.log((vol/err_params['log_Perr'])**3)
             else:
                 true_log_Perr = err_params['log_Perr']
-            true_Perr = jnp.exp(true_log_Perr)
             log_Perr = numpyro.sample("log_Perr", dist.Normal(true_log_Perr, 0.5))
             Perr = jnp.exp(log_Perr)
             #ratio_err = Perr/true_Perr
@@ -468,6 +465,7 @@ def field_inference(boxsize, redshift, which_pk,
             elif which_space == 'r_space':
                 sigma2_eded = Peded*ng3_max/vol
         elif 'fixed_log_Peded' in err_params.keys():
+            fixed_log_Peded = err_params['fixed_log_Peded']
             Peded = jnp.exp(fixed_log_Peded)
             if which_space == 'k_space':
                 sigma_eded = jnp.sqrt(Peded/(2.*vol))
@@ -490,13 +488,6 @@ def field_inference(boxsize, redshift, which_pk,
             elif which_space == 'r_space':
                 sigma2_eed = Peed*ng3_max/vol
             
-        if 'b1_noise' in model_name:            
-            gauss_1d_e = numpyro.sample("gauss_1d_e", dist.Normal(0.0, 1.0), sample_shape=(ng_e**3,))
-            gauss_1d_e = gauss_1d_e * sigma_eded
-            gauss_1d_e_re, gauss_1d_e_im = coord.gauss_to_delta(gauss_1d_e, ng_e)
-            gauss_3d_e = gauss_1d_e_re.reshape(ng_e, ng_e, int(ng_e/2)+1) + 1j*gauss_1d_e_im.reshape(ng_e, ng_e, int(ng_e/2)+1)
-            gauss_3d_e = gauss_3d_e.at[0,0,0].set(0.0)
-
         ### construct the linear field
         if which_ics=='varied_ics':
             delk = A * f_model.linear_modes(cosmo_params_local, gauss_3d)
@@ -504,11 +495,7 @@ def field_inference(boxsize, redshift, which_pk,
             delk = A * f_model.linear_modes(cosmo_params_local, true_gauss_3d)
 
         delk_L = coord.func_extend(ng_L, delk)
-        
-        if 'b1_noise' in model_name:
-            noisek_L = coord.func_extend(ng_L, gauss_3d_e)
-            delk_L = [delk_L, noisek_L]
-        
+                
         if which_space == 'k_space':
             if 'cubic' in model_name:
                 fieldk_model_E = f_model.models(delk_L, biases, pk_lin)
@@ -521,21 +508,15 @@ def field_inference(boxsize, redshift, which_pk,
                 fieldk_model_E = fieldk_model_E * jnp.exp(-0.5*Sigma2*k2_E)
 
             if kmax > 1.0:
-                fieldk_model = coord.reduce_deltak(ng_max, fieldk_model_E)
+                fieldk_model = coord.func_reduce(ng_max, fieldk_model_E)
             else:
                 if ng < ng_E:
-                    fieldk_model = coord.reduce_deltak(ng, fieldk_model_E)
+                    fieldk_model = coord.func_reduce(ng, fieldk_model_E)
                 elif ng == ng_E:
                     fieldk_model = fieldk_model_E
                 elif ng > ng_E:
                     fieldk_model = coord.func_extend(ng, fieldk_model_E)
             field_model_1d_ind = independent_modes(fieldk_model)
-            if 'b1_noise' in model_name:
-                if kmax > 1.0:
-                    ed_red = coord.reduce_deltak(ng_max, noisek_L)
-                else:
-                    ed_red = coord.reduce_deltak(ng, noisek_L)
-                ed_1d_ind = independent_modes(ed_red)
         elif which_space == 'r_space':
             if 'cubic' in model_name:
                 fieldr_model, delr_max, d2r_max = f_model.models(delk_L, biases, pk_lin)
@@ -550,11 +531,8 @@ def field_inference(boxsize, redshift, which_pk,
                 sigma2_err = sigma2_err + 2.0*sigma2_eed*delr_1d_ind + sigma2_eded*d2r_1d_ind
             sigma_err = jnp.sqrt(sigma2_err)
 
-        if 'b1_noise' in model_name:
-            Y = numpyro.sample('Y', dist.Normal(field_model_1d_ind + ratio*ed_1d_ind, sigma_err), obs=deltak_data)
-        else:
-            Y = numpyro.sample('Y', dist.Normal(field_model_1d_ind, sigma_err), obs=deltak_data)
-
+        Y = numpyro.sample('Y', dist.Normal(field_model_1d_ind, sigma_err), obs=deltak_data)
+    '''
     params = []
 
     params += list(cosmo_params.keys())
@@ -579,18 +557,13 @@ def field_inference(boxsize, redshift, which_pk,
     
     if collect_ics==1:
         params += ['gauss_1d']
-    elif collect_ics==2:
-        params += ['gauss_1d']
-        params += ['gauss_1d_e']
 
     min_pe_params = params.copy()
     if which_ics=='varied_ics':
         min_pe_params += ['gauss_1d']
-    if 'b1_noise' in model_name:
-        min_pe_params += ['gauss_1d_e']
-
-    print('save params = ', params, file=sys.stderr)
-    print('min_pe_params = ', min_pe_params, file=sys.stderr)
+    '''
+   # print('save params = ', params, file=sys.stderr)
+   # print('min_pe_params = ', min_pe_params, file=sys.stderr)
     print('dense_mass = ', dense_mass, file=sys.stderr)
     
     n_total = thin*n_samples
@@ -616,15 +589,16 @@ def field_inference(boxsize, redshift, which_pk,
     
     posterior_samples = {}
     min_pe_samples = {}
-    #max_pos_samples = {}
                         
     save_base = f'{save_path}'
     print('save_base = ', save_base, file=sys.stderr)
 
     if i_contd > 0:
-        samples_previous = np.loadtxt(f'{save_base}_{params[0]}_chain{i_chain}.dat')
-        print(f'{params[0]} samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
-        i_contd_check = int(samples_previous.shape[0]/i_sample)
+        #samples_previous = np.loadtxt(f'{save_base}_{params[0]}_chain{i_chain}.dat')
+        #print(f'{params[0]} samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
+        samples_previous = np.loadtxt(f'{save_base}_A_chain{i_chain}.dat')
+        print(f'A samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
+        i_contd_check = samples_previous.shape[0] // i_sample
         print('i_contd = ', i_contd, file=sys.stderr)
         if i_contd != i_contd_check:
             print('i_contd != number of samples_previous * i_sample', file=sys.stderr)
@@ -640,12 +614,15 @@ def field_inference(boxsize, redshift, which_pk,
             last_state = pickle.load(f)
         mcmc.post_warmup_state = last_state
         mcmc._last_state = last_state
-        print('LOADED warmup state = ', file=sys.stderr)
-        print(mcmc.post_warmup_state, file=sys.stderr)
         print('LOADED last state = ', file=sys.stderr)
         print(mcmc.last_state, file=sys.stderr)
+        samples = mcmc.get_samples()
+        params = list(samples.keys())
+        min_pe_params = params.copy()
+        if collect_ics == 0:
+            params.remove('gauss_1d')
         min_pe = np.loadtxt(f'{save_base}_min_pe_chain{i_chain}.dat')
-        for param in min_pe_params:
+        for param in params:
             min_pe_samples[param] = np.loadtxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat')
     elif n_warmup == 1 and (i_chain == 1 or i_chain == 2):
     #elif i_chain == 0:
@@ -665,8 +642,6 @@ def field_inference(boxsize, redshift, which_pk,
         mcmc._last_state = warmup_state
         print('LOADED warmup state = ', file=sys.stderr)
         print(mcmc.post_warmup_state, file=sys.stderr)
-        print('LOADE1D last state = ', file=sys.stderr)
-        print(mcmc.last_state, file=sys.stderr)
     elif n_warmup == 1:
         mcmc_seed += 12345*i_chain
         rng_key = jax.random.PRNGKey(0)
@@ -682,7 +657,6 @@ def field_inference(boxsize, redshift, which_pk,
         print(mcmc.last_state, file=sys.stderr)
     else:
         mcmc_seed += 12345*i_chain
-        #mcmc_seed += 12345*i_chain + 2
         rng_key = jax.random.PRNGKey(mcmc_seed)
         print('rng_seed = ', mcmc_seed, file=sys.stderr)
         mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
@@ -718,17 +692,17 @@ def field_inference(boxsize, redshift, which_pk,
             num_cosmo_params = 0
             
         num_bias_params = 0
-        if 'b1' in dense_mass[0]:
+        if 'b1' in dense_mass[0] or 'Ab1' in dense_mass[0]:
             while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params]) > criteria)
             print('idx of dense mass @ b1 = ', num_cosmo_params, file=sys.stderr)
             print('dense mass @ b1 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params], file=sys.stderr)
             num_bias_params += 1
-        if 'b2' in dense_mass[0]:
+        if 'b2' in dense_mass[0] or 'A2b2' in dense_mass[0]:
             while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
             print('idx of dense mass @ b2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
             print('dense mass @ b2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
             num_bias_params += 1
-        if 'bG2' in dense_mass[0]:
+        if 'bG2' in dense_mass[0] or 'A2bG2' in dense_mass[0]:
             while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
             print('idx of dense mass @ bG2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
             print('dense mass @ bG2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
@@ -793,24 +767,33 @@ def field_inference(boxsize, redshift, which_pk,
         rng_key = jax.random.PRNGKey(mcmc_seed+12*i_chain+123*i+1234*i_contd)
         mcmc.run(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
         samples = mcmc.get_samples()
+        params = list(samples.keys())
+        min_pe_params = params.copy()
+        if collect_ics == 0:
+            params.remove('gauss_1d')
         pes = mcmc.get_extra_fields()['potential_energy']
         min_pe_idx = jnp.argmin(pes)
         if i == 0:
-            if(i_contd==0):
+            if i_contd==0:
                 min_pe = pes[min_pe_idx]
                 print('Min of the potential energy = ', min_pe, file=sys.stderr)
                 for param in min_pe_params:
                     min_pe_samples[param] = samples[param][min_pe_idx]
                     print(f'min_pe_samples[{param}] = ', min_pe_samples[param], file=sys.stderr)
+            else:
+                if pes[min_pe_idx] < min_pe:
+                    min_pe = pes[min_pe_idx]
+                    print('Min of the potential energy = ', min_pe, file=sys.stderr)
+                    for param in min_pe_params:
+                        min_pe_samples[param] = samples[param][min_pe_idx]
+                        print(f'min_pe_samples[{param}] = ', min_pe_samples[param], file=sys.stderr)
             if which_ics=='varied_ics':
                 mean_gauss_1d = jnp.mean(samples['gauss_1d'], axis=0)
-            if 'b1_noise' in model_name:
-                mean_gauss_1d_e = jnp.mean(samples['gauss_1d_e'], axis=0)
             for param in params:
                 posterior_samples[param] = jax.device_put(samples[param].astype(np.float32), cpus[0])
             posterior_samples['potential_energy'] = jax.device_put(pes.astype(np.float32), cpus[0])
         else:
-            if min_pe > pes[min_pe_idx]:
+            if pes[min_pe_idx] < min_pe:
                 min_pe = pes[min_pe_idx]
                 print('Min of the potential energy = ', min_pe, file=sys.stderr)
                 for param in min_pe_params:
@@ -819,9 +802,6 @@ def field_inference(boxsize, redshift, which_pk,
             if which_ics=='varied_ics':
                 tmp_mean = jnp.mean(samples['gauss_1d'], axis=0)
                 mean_gauss_1d = ( i*mean_gauss_1d + tmp_mean )/(i+1)
-            if 'b1_noise' in model_name:
-                tmp_mean_e = jnp.mean(samples['gauss_1d_e'], axis=0)
-                mean_gauss_1d_e = ( i*mean_gauss_1d_e + tmp_mean_e )/(i+1)
             for param in params:
                 posterior_samples[param] = np.concatenate([posterior_samples[param], samples[param].astype(np.float32)])
             posterior_samples['potential_energy'] = np.concatenate([posterior_samples['potential_energy'], pes.astype(np.float32)])
@@ -860,12 +840,6 @@ def field_inference(boxsize, redshift, which_pk,
             mean_gauss_1d_previous = np.loadtxt(f'{save_base}_gauss_1d_mean_chain{i_chain}.dat')
             mean_gauss_1d = ( n_samples*mean_gauss_1d + i_contd*int(i_sample/thin)*mean_gauss_1d_previous )/(n_samples + i_contd*int(i_sample/thin))
         np.savetxt(f'{save_base}_gauss_1d_mean_chain{i_chain}.dat', mean_gauss_1d)
-
-    if 'b1_noise' in model_name:
-        if(i_contd>0):
-            mean_gauss_1d_e_previous = np.loadtxt(f'{save_base}_gauss_1d_e_mean_chain{i_chain}.dat')
-            mean_gauss_1d_e = ( n_samples*mean_gauss_1d_e + i_contd*int(i_sample/thin)*mean_gauss_1d_e_previous )/(n_samples + i_contd*int(i_sample/thin))
-        np.savetxt(f'{save_base}_gauss_1d_e_mean_chain{i_chain}.dat', mean_gauss_1d_e)
 
     np.savetxt(f'{save_base}_min_pe_chain{i_chain}.dat', np.array([min_pe]))
     for param in min_pe_params:

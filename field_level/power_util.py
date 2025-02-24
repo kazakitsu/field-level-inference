@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 
 import jax.numpy as jnp
-import jax
 from jax import jit
 from functools import partial
-
-jax.config.update('jax_enable_x64', True)
 
 import field_level.coord as coord
 
@@ -15,7 +12,7 @@ def power_compute(fieldk_1, fieldk_2, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell=
         raise ValueError(f'{fieldk_1.shape} != {fieldk_2.shape}')
 
     kf = 2*jnp.pi/boxsize
-    kvec = coord.rfftn_kvec([ng,ng,ng], boxsize)
+    kvec = coord.rfftn_kvec([ng,]*3, boxsize)
     k2 = (kvec ** 2).sum(axis=0)
     k = jnp.sqrt(k2)
 
@@ -70,6 +67,8 @@ def power_compute(fieldk_1, fieldk_2, boxsize, nbin=60, kmin=0.0, kmax=0.6, ell=
     k  = jnp.bincount(kidx, weights=k,  length=nbin+1)
     Pk = jnp.bincount(kidx, weights=Pk, length=nbin+1)
     Nk = jnp.bincount(kidx, weights=Nk, length=nbin+1)
+
+    #print('Nk = ', Nk)
 
     k  = k[1:nbin+1]
     Pk = Pk[1:nbin+1]

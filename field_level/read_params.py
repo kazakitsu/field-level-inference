@@ -72,9 +72,6 @@ def read_params(params_file):
                             tmp = dense_mass_elements[i+1]
                         dense_mass.append(tmp)
                     dense_mass = [tuple(dense_mass)]
-            elif 'A' in line:
-                (idx, value) = line.split()
-                cosmo_params[idx] = float(value)
             elif 'sigma8' in line:
                 (idx, value) = line.split()
                 cosmo_params[idx] = float(value)
@@ -84,25 +81,40 @@ def read_params(params_file):
             elif 'hubble' in line:
                 (idx, value) = line.split()
                 cosmo_params[idx] = float(value)
+            elif 'Ab1' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
             elif 'b1' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
+            elif 'A2b2' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'b2' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
+            elif 'A2bG2' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
             elif 'bG2' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
+            elif 'A3bGamma3' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'bGamma3' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
-            elif 'cs2' in line:
+            elif 'A' in line:
                 (idx, value) = line.split()
-                bias_params[idx] = float(value)
-            elif 'c1' in line:
+                cosmo_params[idx] = float(value)
+            elif 'c0' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'c2' in line:
+                (idx, value) = line.split()
+                bias_params[idx] = float(value)
+            elif 'c4' in line:
                 (idx, value) = line.split()
                 bias_params[idx] = float(value)
             elif 'Sigma2' in line:
@@ -154,16 +166,18 @@ def read_params(params_file):
                 (idx, value) = line.split()
                 accept_rate = float(value)
             elif 'mcmc_seed' in line:
-                print(line.split(), file=sys.stderr)
                 (idx, value) = line.split()
                 mcmc_seed = int(value)
             elif 'i_contd' in line:
                 (idx, value) = line.split()
                 i_contd = int(value)
+            elif 'n_chains' in line:
+                (idx, value) = line.split()
+                n_chains = int(value)
 
     ics_params = [which_ics, collect_ics]
     mas_params = [window_order, interlace]
-    mcmc_params = [i_chain, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd]
+    mcmc_params = [i_chain, thin, n_samples, n_chains, n_warmup, accept_rate, mcmc_seed, i_contd]
     
     try:
         ng_params = [ng, ng_L, ng_E, ng_cut, ng_e]
