@@ -2,12 +2,13 @@
 
 import jax.numpy as jnp
 from jax import jit
+import numpy as np
 from functools import partial
 
 def deconvolve(nvec, window_order):
     ng = nvec.shape[1]
-    window_inv = jnp.sinc(nvec / ng)
-    window = 1.0 / jnp.prod(window_inv, axis=0)
+    window_inv = np.sinc(nvec / ng)
+    window = 1.0 / np.prod(window_inv, axis=0)
     return window ** window_order
 
 def rfftn_kvec(shape, boxsize, dtype=float):
@@ -18,7 +19,7 @@ def rfftn_kvec(shape, boxsize, dtype=float):
     kvec.append(jnp.fft.rfftfreq(shape[-1], d=1./shape[-1]).astype(dtype))
     kvec = jnp.meshgrid(*kvec, indexing='ij')
     kvec = jnp.stack(kvec, axis=0)
-    return kvec * (2 * jnp.pi / boxsize)
+    return kvec * (2 * np.pi / boxsize)
 
 def rfftn_khat(kvec):
     """
@@ -38,10 +39,10 @@ def rfftn_mu2(kvec):
     """
     squared kz for `numpy.fft.rfftn`
     """
-    mu2 = kvec[2]**2 / rfftn_k2(kvec)
-    mu2 = mu2.at[0,0,0].set(0.0)
+    k2 = rfftn_k2(kvec)
+    k2 = k2.at[0,0,0].set(1.0)
+    mu2 = kvec[2]**2 / k2
     return mu2
-
 
 def rfftn_disp(kvec):
     k2 = rfftn_k2(kvec)
@@ -58,7 +59,7 @@ def rfftn_tide(kvec):
     trace = jnp.eye(3) / 3.
     trace = jnp.expand_dims(trace, (-1, -2, -3))
     tide -= trace
-    tide = tide.at[:,:,0,0,0].set(0.0)
+    tide[:,:,0,0,0] = 0.0
     return tide
 
 def rfftn_G1(kvec):
@@ -71,6 +72,7 @@ def rfftn_G1(kvec):
     G1 = G1.at[3].set(kvec[1] * kvec[1] / k2)  # G1_yy
     G1 = G1.at[4].set(kvec[1] * kvec[2] / k2)  # G1_yz
     G1 = G1.at[5].set(kvec[2] * kvec[2] / k2)  # G1_zz
+
     G1 = G1.at[:,0,0,0].set(0.0)
     return G1
 
@@ -84,7 +86,6 @@ def coord_func(ng,a,b,c):
         c = ng - c
     return int((a*ng+b)*(ngo2+1)+c)
 
-@partial(jit, static_argnames=('ng',))
 def indep_coord(ng):
     ng2 = ng*ng
     ng3 = ng*ng*ng
@@ -94,36 +95,36 @@ def indep_coord(ng):
     # num = ng * ng * (ng//2 + 1)  # actual size
     
     ### c = 0 plane
-    coord_czero_real = jnp.array([0, 
-                                  coord_func(ng,ngo2,0,0), 
-                                  coord_func(ng,0,ngo2,0), 
-                                  coord_func(ng,ngo2,ngo2,0)
-                                  ], dtype=jnp.uint32)
+    coord_czero_real = np.array([0, 
+                                 coord_func(ng,ngo2,0,0), 
+                                 coord_func(ng,0,ngo2,0), 
+                                 coord_func(ng,ngo2,ngo2,0)
+                                 ], dtype=np.uint32)
     
-    coord_czero_azero_bhalf = jnp.arange(coord_func(ng,0,1,0), 
-                                         coord_func(ng,0,ngo2-1,0)+1, 
-                                         ngo2+1, 
-                                         dtype=jnp.uint32)
+    coord_czero_azero_bhalf = np.arange(coord_func(ng,0,1,0), 
+                                        coord_func(ng,0,ngo2-1,0)+1, 
+                                        ngo2+1, 
+                                        dtype=np.uint32)
     
     coord_czero_azero_bhalf_conj = ng2o2 + ng - coord_czero_azero_bhalf
 
-    coord_czero_ahalf_bzero = jnp.arange(coord_func(ng,1,0,0), 
-                                         coord_func(ng,ngo2-1,0,0)+1, 
-                                         ng2o2+ng, 
-                                         dtype=jnp.uint32)
+    coord_czero_ahalf_bzero = np.arange(coord_func(ng,1,0,0), 
+                                        coord_func(ng,ngo2-1,0,0)+1, 
+                                        ng2o2+ng, 
+                                        dtype=np.uint32)
     
     coord_czero_ahalf_bzero_conj = ng3o2 + ng2 - coord_czero_ahalf_bzero
 
     coord_czero_ahalf_bngo2 = coord_czero_ahalf_bzero + (ng2o2 // 2) + ngo2
     coord_czero_ahalf_bngo2_conj = coord_czero_ahalf_bzero_conj + (ng2o2 // 2) + ngo2
     
-    coord_czero_aall_bhalf = jnp.array([
-        jnp.arange(
+    coord_czero_aall_bhalf = np.array([
+        np.arange(
             coord_func(ng,1,i+1,0), 
             coord_func(ng,ng-1,i+1,0)+1, 
             ng2o2+ng
             ) for i in range(ngo2-1)
-            ], dtype=jnp.uint32)
+            ], dtype=np.uint32)
     coord_czero_aall_bhalf_conj = ng3o2 + 3*ng2o2 + ng - coord_czero_aall_bhalf
 
     ### c = ng/2 plane
@@ -170,7 +171,7 @@ def indep_coord_stack(ng):
      coord_cngo2_ahalf_bngo2, coord_cngo2_ahalf_bngo2_conj,
      coord_cngo2_aall_bhalf, coord_cngo2_aall_bhalf_conj) = indep_coord(ng)
     
-    idx_conjugate_re = jnp.hstack([0,
+    idx_conjugate_re = np.hstack([0,
                                    coord_czero_azero_bhalf_conj,
                                    coord_czero_ahalf_bzero_conj,
                                    coord_czero_ahalf_bngo2_conj,
@@ -180,7 +181,7 @@ def indep_coord_stack(ng):
                                    coord_cngo2_ahalf_bngo2_conj,
                                    coord_cngo2_aall_bhalf_conj.ravel()])
 
-    idx_conjugate_im = jnp.hstack([coord_czero_real,
+    idx_conjugate_im = np.hstack([coord_czero_real,
                                    coord_cngo2_real,
                                    coord_czero_azero_bhalf_conj,
                                    coord_czero_ahalf_bzero_conj,
@@ -203,7 +204,7 @@ def independent_modes_re_im(deltak_1d, idx_conjugate):
     ### delete conjugate in c=0 & c=ng/2 plane
     return jnp.delete(deltak_1d, jnp.array(idx_conjugate))
 
-@partial(jit, static_argnames=('idx_conjugate_real', 'idx_conjugate_imag'))
+#@partial(jit, static_argnames=('idx_conjugate_real', 'idx_conjugate_imag'))
 def independent_modes(deltak, idx_conjugate_real, idx_conjugate_imag):
     num = deltak.size
     deltak_1d = deltak.reshape(num)
@@ -230,8 +231,7 @@ def func_extend(ng_ext, array3d):
     
     return array_extended
 
-@partial(jit, static_argnames=('ng_red', ))
-def func_reduce_(ng_red, array3d):
+def _func_reduce(ng_red, array3d):
     '''
     array3d: shape=(ng, ng, ng//2+1)  -> (ng_red, ng_red, ng_red//2+1)
     '''
@@ -266,7 +266,7 @@ def func_reduce(ng_red, array3d):
     ngo2_red = ng_red // 2
     num_red = ng_red*ng_red*(ngo2_red + 1)
 
-    array3d_red = func_reduce_(ng_red, array3d)
+    array3d_red = _func_reduce(ng_red, array3d)
 
     array1d_red = array3d_red.reshape(num_red)
 

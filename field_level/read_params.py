@@ -177,7 +177,7 @@ def read_params(params_file):
 
     ics_params = [which_ics, collect_ics]
     mas_params = [window_order, interlace]
-    mcmc_params = [i_chain, thin, n_samples, n_chains, n_warmup, accept_rate, mcmc_seed, i_contd]
+    mcmc_params = [i_chain, n_chains, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd]
     
     try:
         ng_params = [ng, ng_L, ng_E, ng_cut, ng_e]

@@ -9,15 +9,19 @@ if jax.config.read('jax_enable_x64'):
     numpyro.enable_x64()
     print('NumPyro x64 mode is enabled because JAX is in x64 mode.', file=sys.stderr)
 
+num_local_devices = jax.local_device_count()
+numpyro.set_host_device_count(num_local_devices)
+
 import jax.numpy as jnp
 from jax import random
 import jax.scipy as jsp
 from jax import jit
+from jax.tree_util import tree_map
 from numpyro.infer import MCMC, NUTS
 import numpyro.distributions as dist
 from functools import partial
 import pickle
-import time
+import copy
 
 import field_level.coord as coord
 import field_level.forward_model as forward_model
@@ -33,7 +37,7 @@ def field_inference(boxsize, redshift, which_pk,
                     cosmo_params, bias_params, err_params, kmax, 
                     dense_mass, mcmc_params,
                     **kwargs):
-    """ 
+    """
     Field-level inference with numpyro NUTS
 
     Parameters
@@ -117,9 +121,7 @@ def field_inference(boxsize, redshift, which_pk,
     which_ics, collect_ics = ics_params
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
-    i_chain, thin, n_samples, n_chains, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
-    if n_chains > 1 and i_chain >= 0:
-        raise ValueError('i_chain must be negative if n_chains > 1')
+    i_chain, n_chains, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
     if i_contd > 0:
         n_warmup = 1
     if 'fixed_log_Perr' in err_params.keys():
@@ -152,6 +154,9 @@ def field_inference(boxsize, redshift, which_pk,
 
     if len(ng_params) == 3:
         ng, ng_L, ng_E = ng_params
+        ng = int(ng)
+        ng_L = int(ng_L)
+        ng_E = int(ng_E)
     elif len(ng_params) == 5:
         ng, ng_L, ng_E, ng_cut, ng_e = ng_params
     print('ng = ', ng, file=sys.stderr)
@@ -159,8 +164,8 @@ def field_inference(boxsize, redshift, which_pk,
     print('ng_E = ', ng_E, file=sys.stderr)
     print('kmax = ', kmax, file=sys.stderr)
 
-    ng3 = ng**3
-    ngo2 = int(ng/2)
+    ng3 = int(ng**3)
+    ngo2 = ng % 2
         
     if 'lpt' in model_name:
         f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space, mas_params=mas_params)
@@ -169,17 +174,7 @@ def field_inference(boxsize, redshift, which_pk,
         
     ### prepare kvecs
     f_model.kvecs(kmax)
-    
-    cosmo_params_tmp = [0.02242, 
-                        0.11933,
-                        0.73,
-                        0.9665,
-                        3.047,
-                        redshift]
-    
-    ### get the linear power spectrum
-    linear_pk = f_model.linear_power(cosmo_params_tmp)
-    
+
     ### find indeces of independent modes
     if which_space == 'k_space':
         if kmax > 1.0:
@@ -190,8 +185,8 @@ def field_inference(boxsize, redshift, which_pk,
         else:
             idx_conjugate_real, idx_conjugate_imag = coord.indep_coord_stack(ng)
             idx_kmax = coord.kmax_modes(ng, boxsize, kmax)
-            idx_conjugate_real_kmax = jnp.unique(jnp.concatenate([idx_conjugate_real, idx_kmax]))
-            idx_conjugate_imag_kmax = jnp.unique(jnp.concatenate([idx_conjugate_imag, idx_kmax]))
+            idx_conjugate_real_kmax = np.unique(np.concatenate([idx_conjugate_real, idx_kmax]))
+            idx_conjugate_imag_kmax = np.unique(np.concatenate([idx_conjugate_imag, idx_kmax]))
    
         print('idx_conjugate_real_kmax.shape = ', idx_conjugate_real_kmax.shape, file=sys.stderr)
         print('idx_conjugate_imag_kmax.shape = ', idx_conjugate_imag_kmax.shape, file=sys.stderr)
@@ -257,8 +252,9 @@ def field_inference(boxsize, redshift, which_pk,
         else:
             kvec = coord.rfftn_kvec([ng,]*3, boxsize)
         k2 = coord.rfftn_k2(kvec)
-        mu2 = kvec[2]*kvec[2]/k2
         k2_1d_ind = independent_modes(k2)/(k_NL*k_NL) ###normalized by (k/k_NL)^2
+        k2 = k2.at[0,0,0].set(1.0)
+        mu2 = kvec[2]*kvec[2]/k2
         mu2_1d_ind = independent_modes(mu2) ###normalized by (k/k_NL)^2
     
     if 'Sigma2' in model_name:
@@ -267,7 +263,7 @@ def field_inference(boxsize, redshift, which_pk,
         mu2_E = kvec_E[2]*kvec_E[2]/k2_E
         del kvec_E
 
-    def model(deltak_data):
+    def model(obs_data):
         if which_ics=='varied_ics':
             gauss_1d = numpyro.sample("gauss_1d", dist.Normal(0.0, 1.0), sample_shape=(ng3,))
             gauss_3d = coord.gauss_1d_to_3d(gauss_1d, ng)
@@ -337,53 +333,61 @@ def field_inference(boxsize, redshift, which_pk,
         if 'A2b2' in bias_params.keys():
             true_A2b2 = bias_params['A2b2']
             A2b2 = numpyro.sample('A2b2', dist.Normal(true_A2b2, 2.))
-            b2 = numpyro.deterministic('b2', A2b2/A/A)
+            A2 = A*A
+            b2 = numpyro.deterministic('b2', A2b2/A2)
         elif 'b2' in bias_params.keys():
             true_b2 = bias_params['b2']
             b2 = numpyro.sample('b2', dist.Normal(true_b2, 2.))
         else:
-            b2 = -0.5
+            b2 = 0.0
             
         if 'A2bG2' in bias_params.keys():
             true_A2bG2 = bias_params['A2bG2']
             A2bG2 = numpyro.sample('A2bG2', dist.Normal(true_A2bG2, 2.))
-            bG2 = numpyro.deterministic('bG2', A2bG2/A/A)
+            A2 = A*A
+            bG2 = numpyro.deterministic('bG2', A2bG2/A2)
         elif 'bG2' in bias_params.keys():
             true_bG2 = bias_params['bG2']
             bG2 = numpyro.sample('bG2', dist.Normal(true_bG2, 2.))
         else:
-            bG2 = -0.5
+            bG2 = 0.0
             
         if 'A3bGamma3' in bias_params.keys():
             true_A3bGamma3 = bias_params['A3bGamma3']
-            A3bGamma3 = numpyro.sample('A2bG2', dist.Normal(true_A3bGamma3, 2.))
-            bGamma3 = numpyro.deterministic('bGamma3', dist.Normal(A3bGamma3/A/A/A, 2.))
+            A3bGamma3 = numpyro.sample('A3bGamma3', dist.Normal(true_A3bGamma3, 2.))
+            bGamma3 = numpyro.deterministic('bGamma3', A3bGamma3/A/A/A)
         elif 'bGamma3' in bias_params.keys():
             true_bGamma3 = bias_params['bGamma3']
             bGamma3 = numpyro.sample('bGamma3', dist.Normal(true_bGamma3, 2.))
         else:
-            bGamma3 = -0.5
+            bGamma3 = 0.0
+
+        if 'A3b3' in bias_params.keys():
+            true_A3b3 = bias_params['A3b3']
+            A3b3 = numpyro.sample('A3b3', dist.Normal(true_A3b3, 2.))
+            b3 = numpyro.deterministic('b3', A3b3/A/A/A)
+        elif 'b3' in bias_params.keys():
+            true_b3 = bias_params['b3']
+            b3 = numpyro.sample('b3', dist.Normal(true_b3, 2.))
+        else:
+            b3 = 0.0
+
                     
         ### counter terms
         if 'c0' in bias_params.keys():
             true_c0 = bias_params['c0']
             c0 = numpyro.sample('c0', dist.Normal(true_c0, 20.))
         else:
-            #cs2 = -1.2829 or -2.099673 for 1lpt_matter 
-            #cs2 = -3.934091 for 1lpt_matter_lin 
-            #cs2 = -3.342199 ### for 1lpt_matter_rsd_lin
             cs2 = -2.705611 ### for 1lpt_matter_rsd_quad
         if 'c2' in bias_params.keys():
             true_c2 = bias_params['c2']
             c2 = numpyro.sample('c2', dist.Normal(true_c2, 20.))
         else:
-            #c1 = -9.907751 ### for 1lpt_matter_rsd_lin
             c2 = -11.00391 ### for 1lpt_matter_rsd_quad
         if 'c4' in bias_params.keys():
             true_c4 = bias_params['c4']
             c4 = numpyro.sample('c4', dist.Normal(true_c4, 20.))
         else:
-            #c2 = 4.668099 ### for 1lpt_matter_rsd_lin
             c4 = 5.498273 ### for 1lpt_matter_rsd_quad
             
         if 'Sigma2' in bias_params.keys():
@@ -430,8 +434,6 @@ def field_inference(boxsize, redshift, which_pk,
                 true_log_Perr = err_params['log_Perr']
             log_Perr = numpyro.sample("log_Perr", dist.Normal(true_log_Perr, 0.5))
             Perr = jnp.exp(log_Perr)
-            #ratio_err = Perr/true_Perr
-            #Pres = numpyro.deterministic("Pres", ratio_err - 1.0)
         else:
             if fixed_log_Perr > 15.:
                 Perr = (vol/fixed_log_Perr)**3
@@ -531,39 +533,8 @@ def field_inference(boxsize, redshift, which_pk,
                 sigma2_err = sigma2_err + 2.0*sigma2_eed*delr_1d_ind + sigma2_eded*d2r_1d_ind
             sigma_err = jnp.sqrt(sigma2_err)
 
-        Y = numpyro.sample('Y', dist.Normal(field_model_1d_ind, sigma_err), obs=deltak_data)
-    '''
-    params = []
+        Y = numpyro.sample('Y', dist.Normal(field_model_1d_ind, sigma_err), obs=obs_data)
 
-    params += list(cosmo_params.keys())
-    if 'A' in cosmo_params.keys():
-        params += ['sigma8']
-    if 'sigma8' in cosmo_params.keys():
-        params += ['A']
-    if 'hubble' in cosmo_params.keys():
-        params += ['H0']
-    if 'oc' in cosmo_params.keys() or 'hubble' in cosmo_params.keys():
-        params += ['OM']
-    if 'rsd' in model_name:
-        params += ['growth_f',]
-
-    params += list(bias_params.keys())
-    params += list(err_params.keys())
-    if 'log_Peded' in err_params.keys():
-        params += ['Peded']
-    if 'Peed' in err_params.keys():
-        params += ['scaled_Peed']
-        params += ['ratio']
-    
-    if collect_ics==1:
-        params += ['gauss_1d']
-
-    min_pe_params = params.copy()
-    if which_ics=='varied_ics':
-        min_pe_params += ['gauss_1d']
-    '''
-   # print('save params = ', params, file=sys.stderr)
-   # print('min_pe_params = ', min_pe_params, file=sys.stderr)
     print('dense_mass = ', dense_mass, file=sys.stderr)
     
     n_total = thin*n_samples
@@ -576,155 +547,190 @@ def field_inference(boxsize, redshift, which_pk,
                                      adapt_mass_matrix=True,
                                      dense_mass=dense_mass,
                                      max_tree_depth=(9, 9),
+                                     forward_mode_differentiation=False,
                                      init_strategy=numpyro.infer.init_to_sample)
+
+    if n_chains == 1:
+        chain_method = 'sequential'
+    elif n_chains >= 2:
+        chain_method = 'parallel'
+
+    mcmc = numpyro.infer.MCMC(kernel,
+                              num_samples=1,
+                              num_warmup=1,
+                              num_chains=n_chains,
+                              thinning=thin,
+                              chain_method=chain_method,
+                              progress_bar=False)
+
+    ### check the mcmc model by running warmup once
+    rng_key = jax.random.PRNGKey(0)
+    mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
+    params = list(mcmc.get_samples().keys())
+    params.append('potential_energy')
+    min_pe_params = params.copy()
+
+    if collect_ics == 0:
+        params.remove('gauss_1d')
+
+    print('params = ', params, file=sys.stderr)
+    print('min_pe_params = ', min_pe_params, file=sys.stderr)
+
+    del mcmc
 
     mcmc = numpyro.infer.MCMC(kernel,
                               num_samples=i_sample,
                               num_warmup=n_warmup,
                               num_chains=n_chains,
                               thinning=thin,
-                              #chain_method="sequential",
-                              chain_method="parallel",
+                              chain_method=chain_method,
                               progress_bar=False)
     
     posterior_samples = {}
     min_pe_samples = {}
+    for param in min_pe_params:
+        if param == 'gauss_1d':
+            min_pe_samples[param] = np.zeros((n_chains, ng3))
+        else:
+            min_pe_samples[param] = np.zeros(n_chains)
                         
     save_base = f'{save_path}'
     print('save_base = ', save_base, file=sys.stderr)
 
     if i_contd > 0:
-        #samples_previous = np.loadtxt(f'{save_base}_{params[0]}_chain{i_chain}.dat')
-        #print(f'{params[0]} samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
-        samples_previous = np.loadtxt(f'{save_base}_A_chain{i_chain}.dat')
-        print(f'A samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
-        i_contd_check = samples_previous.shape[0] // i_sample
+        samples_previous = np.loadtxt(f'{save_base}_{params[0]}_chain{i_chain}.dat')
+        print(f'{params[0]} samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
+        i_contd_check = int(samples_previous.shape[0]/i_sample)
         print('i_contd = ', i_contd, file=sys.stderr)
         if i_contd != i_contd_check:
             print('i_contd != number of samples_previous * i_sample', file=sys.stderr)
             sys.exit(1)
         else:
             print('i_contd == number of samples_previous * i_sample', file=sys.stderr)
-
-    if i_contd > 0:
         rng_key = jax.random.PRNGKey(0)
-        mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
+        mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
         print('Restarting samping...', file=sys.stderr)
-        with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
-            last_state = pickle.load(f)
-        mcmc.post_warmup_state = last_state
-        mcmc._last_state = last_state
-        print('LOADED last state = ', file=sys.stderr)
-        print(mcmc.last_state, file=sys.stderr)
-        samples = mcmc.get_samples()
-        params = list(samples.keys())
-        min_pe_params = params.copy()
-        if collect_ics == 0:
-            params.remove('gauss_1d')
-        min_pe = np.loadtxt(f'{save_base}_min_pe_chain{i_chain}.dat')
-        for param in params:
-            min_pe_samples[param] = np.loadtxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat')
-    elif n_warmup == 1 and (i_chain == 1 or i_chain == 2):
-    #elif i_chain == 0:
-    #elif i_chain > 0:
-        rng_key = jax.random.PRNGKey(0)
-        n_warmup = 1
-        mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
-        #print(f'Loading post warmup state from {save_base}_2_24710_warmup_state.pkl ...', file=sys.stderr)
-        #print(f'Loading post warmup state from {save_base}_1_24710_warmup_state.pkl ...', file=sys.stderr)
-        #print(f'Loading post warmup state from {save_base}_1_12355_warmup_state.pkl ...', file=sys.stderr)
-        print(f'Loading post warmup state from {save_base}_0_{mcmc_seed}_warmup_state.pkl ...', file=sys.stderr)
-        #with open(f'{save_base}_2_24710_warmup_state.pkl', 'rb') as f:
-        with open(f'{save_base}_0_{mcmc_seed}_warmup_state.pkl', 'rb') as f:
-        #with open(f'{save_base}_1_12355_warmup_state.pkl', 'rb') as f:
-            warmup_state = pickle.load(f)
-        mcmc.post_warmup_state = warmup_state
-        mcmc._last_state = warmup_state
+        if n_chains == 1:
+            with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
+                last_state = pickle.load(f)
+            mcmc.post_warmup_state = last_state
+        else:
+            for c in range(n_chains):
+                i_chain_ = i_chain + c
+                with open(f'{save_base}_{i_chain_}_{i_contd}_last_state.pkl', 'rb') as f:
+                    last_state = pickle.load(f)
+                last_state = tree_map(jnp.array, last_state)
+                mcmc.post_warmup_state = merge_hmc_states(mcmc.post_warmup_state, last_state, c)
         print('LOADED warmup state = ', file=sys.stderr)
         print(mcmc.post_warmup_state, file=sys.stderr)
-    elif n_warmup == 1:
-        mcmc_seed += 12345*i_chain
+        for c in range(n_chains):
+            i_chain_ = i_chain + c
+            for param in min_pe_params:
+                min_pe_samples[param][c] = np.loadtxt(f'{save_base}_{param}_min_pe_chain{i_chain_}.dat')
+    elif n_warmup <= 1:
         rng_key = jax.random.PRNGKey(0)
-        mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
-        print(f'Loading post warmup state from {save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl ...', file=sys.stderr)
-        with open(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl', 'rb') as f:
-            warmup_state = pickle.load(f)
-        mcmc.post_warmup_state = warmup_state
-        mcmc._last_state = warmup_state
+        mcmc.warmup(rng_key, 
+                    obs_data=data_1d_ind, 
+                    extra_fields=('potential_energy',))
+        for c in range(n_chains):
+            i_chain_ = i_chain + c
+            mcmc_seed_ = mcmc_seed + 12345*i_chain_
+            with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
+                warmup_state = pickle.load(f)
+            warmup_state = tree_map(jnp.array, warmup_state)
+            mcmc.post_warmup_state = merge_hmc_states(mcmc.post_warmup_state, warmup_state, c)
         print('LOADED warmup state = ', file=sys.stderr)
         print(mcmc.post_warmup_state, file=sys.stderr)
-        print('LOADED last state = ', file=sys.stderr)
-        print(mcmc.last_state, file=sys.stderr)
     else:
         mcmc_seed += 12345*i_chain
         rng_key = jax.random.PRNGKey(mcmc_seed)
         print('rng_seed = ', mcmc_seed, file=sys.stderr)
-        mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
-        inv_mass_matrix = mcmc.post_warmup_state.adapt_state.inverse_mass_matrix
+        mcmc.warmup(rng_key, 
+                    obs_data=data_1d_ind, 
+                    extra_fields=('potential_energy',), 
+                    collect_warmup=False)
+        print('post_warmup_state = ', file=sys.stderr)
+        print(mcmc.post_warmup_state, file=sys.stderr)
+        inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
+
+        if n_chains == 1:
+            inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None,:,:]
     
         i_warmup = 1
-        print(inv_mass_matrix, file=sys.stderr)
+        print('inv_mass_matrix = ', inv_mass_matrix, file=sys.stderr)
         print('i_warmup = ', i_warmup, file=sys.stderr)
        
         criteria = 0.9
         
         while_check = 0
+
+        print('inv_mass_matrix.shape = ', inv_mass_matrix[dense_mass[0]].shape, file=sys.stderr)
         
         if 'A' in dense_mass[0]:
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,0,0]) > criteria).any()
         
         if 'A' in dense_mass[0] and 'scaled_oc' in dense_mass[0] and 'scaled_hubble' in dense_mass[0]:
             num_cosmo_params = 3
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][2,2]) > criteria)
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,1,1]) > criteria).any()
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,2,2]) > criteria).any()
         elif 'A' in dense_mass[0] and 'scaled_oc' in dense_mass[0]:
             num_cosmo_params = 2
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,1,1]) > criteria).any()
         elif 'scaled_oc' in dense_mass[0] and 'scaled_hubble' in dense_mass[0]:
             num_cosmo_params = 2
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,1,1]) > criteria).any()
         elif 'scaled_hubble' in dense_mass[0] and 'A' in dense_mass[0]:
             num_cosmo_params = 2
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][1,1]) > criteria)
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,1,1]) > criteria).any()
         elif 'A' in dense_mass[0] or 'scaled_oc' in dense_mass[0] or 'scaled_hubble' in dense_mass[0]:
             num_cosmo_params = 1
         else:
             num_cosmo_params = 0
             
         num_bias_params = 0
-        if 'b1' in dense_mass[0] or 'Ab1' in dense_mass[0]:
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params]) > criteria)
+        if 'b1' in dense_mass[0]:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:num_cosmo_params,num_cosmo_params]) > criteria).any()
             print('idx of dense mass @ b1 = ', num_cosmo_params, file=sys.stderr)
-            print('dense mass @ b1 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params], file=sys.stderr)
+            print('dense mass @ b1 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params,num_cosmo_params], file=sys.stderr)
             num_bias_params += 1
-        if 'b2' in dense_mass[0] or 'A2b2' in dense_mass[0]:
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+        if 'b2' in dense_mass[0]:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria).any()
             print('idx of dense mass @ b2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
-            print('dense mass @ b2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
+            print('dense mass @ b2 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
             num_bias_params += 1
-        if 'bG2' in dense_mass[0] or 'A2bG2' in dense_mass[0]:
-            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+        if 'bG2' in dense_mass[0]:
+            while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria).any()
             print('idx of dense mass @ bG2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
-            print('dense mass @ bG2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
+            print('dense mass @ bG2 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
+       
+        post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
+        chain_warmup_states = split_hmc_state_by_chain(post_warmup_state, n_chains)
+        for c in range(n_chains):
+            i_chain_ = i_chain + c
+            mcmc_seed_ = mcmc_seed + 12345*i_chain_
+            with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'wb') as f:
+                pickle.dump(chain_warmup_states[c], f)
 
         print('while = ', while_check, file=sys.stderr)
-        
-        with open(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
-            pickle.dump(mcmc.post_warmup_state, f)
         
         while( while_check > 0 ):
             rng_key = jax.random.PRNGKey(mcmc_seed+i_warmup)
             print('rng_seed = ',mcmc_seed+i_warmup, file=sys.stderr)
             print('rng key = ', rng_key, file=sys.stderr)
-            mcmc.warmup(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
-            inv_mass_matrix = mcmc.post_warmup_state.adapt_state.inverse_mass_matrix
+            mcmc.warmup(rng_key, 
+                        obs_data=data_1d_ind, 
+                        extra_fields=('potential_energy',))
+            inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
+
+            if n_chains == 1:
+                inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None,:,:]
+
             i_warmup += 1
             print(inv_mass_matrix, file=sys.stderr)
-            
             while_check = 0
         
             if 'A' in dense_mass[0]:
-                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][0,0]) > criteria)
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,0,0]) > criteria).any()
         
             if 'A' in dense_mass[0] and 'scaled_oc' in dense_mass[0] and 'scaled_hubble' in dense_mass[0]:
                 num_cosmo_params = 3
@@ -741,117 +747,190 @@ def field_inference(boxsize, redshift, which_pk,
             
             num_bias_params = 0
             if 'b1' in dense_mass[0]:
-                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params]) > criteria)
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,num_cosmo_params,num_cosmo_params]) > criteria).any()
                 print('idx of dense mass @ b1 = ', num_cosmo_params, file=sys.stderr)
-                print('dense mass @ b1 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params,num_cosmo_params], file=sys.stderr)
+                print('dense mass @ b1 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params,num_cosmo_params], file=sys.stderr)
                 num_bias_params += 1
             if 'b2' in dense_mass[0]:
-                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria).any()
                 print('idx of dense mass @ b2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
-                print('dense mass @ b2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
+                print('dense mass @ b2 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
                 num_bias_params += 1
             if 'bG2' in dense_mass[0]:
-                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria)
+                while_check += (jnp.abs(inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params]) > criteria).any()
                 print('idx of dense mass @ bG2 = ', num_cosmo_params+num_bias_params, file=sys.stderr)
-                print('dense mass @ bG2 = ', inv_mass_matrix[dense_mass[0]][num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
+                print('dense mass @ bG2 = ', inv_mass_matrix[dense_mass[0]][:,num_cosmo_params+num_bias_params,num_cosmo_params+num_bias_params], file=sys.stderr)
 
             print('while = ', while_check, file=sys.stderr)
             
             print('i_warmup = ', i_warmup, file=sys.stderr)
-        
-            with open(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
-                pickle.dump(mcmc.post_warmup_state, f)
+
+            post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
+            chain_warmup_states = split_hmc_state_by_chain(post_warmup_state, n_chains)
+            for c in range(n_chains):
+                i_chain_ = i_chain + c
+                mcmc_seed_ = mcmc_seed + 12345*i_chain_
+                with open(f'{save_base}_{i_chain_}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
+                    pickle.dump(chain_warmup_states[c], f)
+
+    min_pe_idx = []
+    mean_gauss_1d = []
 
     for i in range(i_iter):
         print(f'running batch {i} ...', file=sys.stderr)
-        rng_key = jax.random.PRNGKey(mcmc_seed+12*i_chain+123*i+1234*i_contd)
-        mcmc.run(rng_key, deltak_data=data_1d_ind, extra_fields=('potential_energy',))
-        samples = mcmc.get_samples()
-        params = list(samples.keys())
-        min_pe_params = params.copy()
-        if collect_ics == 0:
-            params.remove('gauss_1d')
-        pes = mcmc.get_extra_fields()['potential_energy']
-        min_pe_idx = jnp.argmin(pes)
-        if i == 0:
-            if i_contd==0:
-                min_pe = pes[min_pe_idx]
-                print('Min of the potential energy = ', min_pe, file=sys.stderr)
-                for param in min_pe_params:
-                    min_pe_samples[param] = samples[param][min_pe_idx]
-                    print(f'min_pe_samples[{param}] = ', min_pe_samples[param], file=sys.stderr)
-            else:
-                if pes[min_pe_idx] < min_pe:
-                    min_pe = pes[min_pe_idx]
-                    print('Min of the potential energy = ', min_pe, file=sys.stderr)
-                    for param in min_pe_params:
-                        min_pe_samples[param] = samples[param][min_pe_idx]
-                        print(f'min_pe_samples[{param}] = ', min_pe_samples[param], file=sys.stderr)
-            if which_ics=='varied_ics':
-                mean_gauss_1d = jnp.mean(samples['gauss_1d'], axis=0)
+        mcmc.run(mcmc.post_warmup_state.rng_key, 
+                 obs_data=data_1d_ind, 
+                 extra_fields=('potential_energy',))
+        samples = mcmc.get_samples(group_by_chain=True)
+        samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
+        if i==0:
             for param in params:
                 posterior_samples[param] = jax.device_put(samples[param].astype(np.float32), cpus[0])
-            posterior_samples['potential_energy'] = jax.device_put(pes.astype(np.float32), cpus[0])
+            for c in range(n_chains):
+                if which_ics=='varied_ics':
+                    mean_gauss_1d.append(np.mean(samples['gauss_1d'][c], axis=0))
+                ### find sample where the potential energy is minimum
+                min_pe_idx.append(np.argmin(samples['potential_energy'][c]))
+                min_pe_batch = samples['potential_energy'][c][min_pe_idx[c]]
+                if i_contd==0:
+                    for param in min_pe_params:
+                        min_pe_samples[param][c] = samples[param][c][min_pe_idx[c]]
+                else:
+                    if min_pe_batch <= min_pe_samples['potential_energy'][c]:
+                        for param in min_pe_params:
+                            min_pe_samples[param][c] = samples[param][c][min_pe_idx[c]]
+            print(f'samples at the minimum potential = ', file=sys.stderr)
+            for key in min_pe_samples.keys():
+                print(f'{key} = ', min_pe_samples[key], file=sys.stderr)
         else:
-            if pes[min_pe_idx] < min_pe:
-                min_pe = pes[min_pe_idx]
-                print('Min of the potential energy = ', min_pe, file=sys.stderr)
-                for param in min_pe_params:
-                    min_pe_samples[param] = samples[param][min_pe_idx]
-                    print(f'min_pe_samples[{param}] = ', min_pe_samples[param], file=sys.stderr)
-            if which_ics=='varied_ics':
-                tmp_mean = jnp.mean(samples['gauss_1d'], axis=0)
-                mean_gauss_1d = ( i*mean_gauss_1d + tmp_mean )/(i+1)
             for param in params:
-                posterior_samples[param] = np.concatenate([posterior_samples[param], samples[param].astype(np.float32)])
-            posterior_samples['potential_energy'] = np.concatenate([posterior_samples['potential_energy'], pes.astype(np.float32)])
+                posterior_samples[param] = np.concatenate([
+                    posterior_samples[param], 
+                    samples[param].astype(np.float32)], 
+                    axis=1)
+            for c in range(n_chains):
+                if which_ics=='varied_ics':
+                    tmp_mean = np.mean(samples['gauss_1d'][c], axis=0)
+                    mean_gauss_1d[c] = ( i*mean_gauss_1d[c] + tmp_mean )/(i+1)
+                ### find sample where the potential energy is minimum
+                min_pe_idx.append(np.argmin(samples['potential_energy'][c]))
+                min_pe_batch = samples['potential_energy'][c][min_pe_idx[c]]
+                if min_pe_batch <= min_pe_samples['potential_energy'][c]:
+                    for param in min_pe_params:
+                        min_pe_samples[param][c] = samples[param][c][min_pe_idx[c]]
+        last_state = mcmc.last_state
+        mcmc.post_warmup_state = last_state
         del samples
-        mcmc.post_warmup_state = mcmc.last_state
-        if(i==0):
-            print(f'i={i}, mcmc.last_state = ', file=sys.stderr)
-            print(mcmc.last_state, file=sys.stderr)
-        elif(i==i_iter-1):
-            print(f'i={i}, mcmc.last_state = ', file=sys.stderr)
-            print(mcmc.last_state, file=sys.stderr)
-            i = i + i_contd + 1
-            with open(f'{save_base}_{i_chain}_{i}_last_state.pkl', 'wb') as f:
-                pickle.dump(mcmc.last_state, f)
-        #gc.collect()
+        if(i==i_iter-1):
+            print(f'i={i}, last_state = ', file=sys.stderr)
+            print(last_state, file=sys.stderr)
+            i_last = i + i_contd + 1
+            chain_last_states = split_hmc_state_by_chain(last_state, n_chains)
+            for c in range(n_chains):
+                i_chain_ = i_chain + c
+                with open(f'{save_base}_{i_chain_}_{i_last}_last_state.pkl', 'wb') as f:
+                    pickle.dump(chain_last_states[c], f)
+
+    print(f'samples at the minimum potential = ', file=sys.stderr)
+    for key in min_pe_samples.keys():
+        print(f'{key} = ', min_pe_samples[key], file=sys.stderr)
     
-    params.append('potential_energy')
-
-    for param in params:
-        print(f'posterior_sample[{param}]', posterior_samples[param].shape, file=sys.stderr)
-        print(f'posterior_sample[{param}] = ', posterior_samples[param], file=sys.stderr)
-        if(i_contd>0):
-            samples_previous = np.loadtxt(f'{save_base}_{param}_chain{i_chain}.dat')
-            print('samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
-            if param=='gauss_1d':
-                posterior_samples[param] = np.vstack([samples_previous.astype(np.float32), posterior_samples[param]])
-            elif param=='gauss_1d_e':
-                posterior_samples[param] = np.vstack([samples_previous.astype(np.float32), posterior_samples[param]])
+    for c in range(n_chains):
+        i_chain_ = i_chain + c
+        for param in params:
+            print(f'posterior_sample[[{param}][{c}].shape = ', posterior_samples[param][c].shape, file=sys.stderr)
+            print(f'posterior_sample[{param}][{c}] = ', posterior_samples[param][c], file=sys.stderr)
+            if(i_contd>0):
+                samples_previous = np.loadtxt(f'{save_base}_{param}_chain{i_chain_}.dat')
+                print('samples_previous.shape = ', samples_previous.shape, file=sys.stderr)
+                if param=='gauss_1d':
+                    samples = np.hstack([samples_previous.astype(np.float32), posterior_samples[param][c].T])
+                    samples = samples.T
+                elif param=='gauss_1d_e':
+                    samples = np.hstack([samples_previous.astype(np.float32), posterior_samples[param][c].T])
+                    samples = samples.T
+                else:
+                    samples = np.hstack([samples_previous.astype(np.float32), posterior_samples[param][c]])
+                    samples = samples.reshape(-1,1)
             else:
-                posterior_samples[param] = np.hstack([samples_previous.astype(np.float32), posterior_samples[param]])
-                posterior_samples[param] = posterior_samples[param].reshape(-1,1)
-        np.savetxt(f'{save_base}_{param}_chain{i_chain}.dat', posterior_samples[param])
+                samples = posterior_samples[param][c]
+                if param=='gauss_1d' or param=='gauss_1d_e':
+                    samples = samples.T
+                else:
+                    samples = samples.reshape(-1,1)
+            np.savetxt(f'{save_base}_{param}_chain{i_chain_}.dat', samples)
 
-    if which_ics=='varied_ics':
-        if(i_contd>0):
-            mean_gauss_1d_previous = np.loadtxt(f'{save_base}_gauss_1d_mean_chain{i_chain}.dat')
-            mean_gauss_1d = ( n_samples*mean_gauss_1d + i_contd*int(i_sample/thin)*mean_gauss_1d_previous )/(n_samples + i_contd*int(i_sample/thin))
-        np.savetxt(f'{save_base}_gauss_1d_mean_chain{i_chain}.dat', mean_gauss_1d)
+        if which_ics=='varied_ics':
+            if(i_contd>0):
+                mean_gauss_1d_previous = np.loadtxt(f'{save_base}_gauss_1d_mean_chain{i_chain_}.dat')
+                mean_gauss_1d[c] = ( n_samples*mean_gauss_1d[c] + i_contd*int(i_sample/thin)*mean_gauss_1d_previous )/(n_samples + i_contd*int(i_sample/thin))
+            np.savetxt(f'{save_base}_gauss_1d_mean_chain{i_chain_}.dat', mean_gauss_1d[c])
 
-    np.savetxt(f'{save_base}_min_pe_chain{i_chain}.dat', np.array([min_pe]))
-    for param in min_pe_params:
-        print(f'min_pe_sample[{param}]', min_pe_samples[param].shape, file=sys.stderr)
-        if param=='gauss_1d':
-            np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat', min_pe_samples[param])
-        elif param=='gauss_1d_e':
-            np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat', min_pe_samples[param])
-        else:
-            np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain}.dat', np.array([min_pe_samples[param]]))
+        if 'b1_noise' in model_name:
+            if(i_contd>0):
+                mean_gauss_1d_e_previous = np.loadtxt(f'{save_base}_gauss_1d_e_mean_chain{i_chain}.dat')
+                mean_gauss_1d_e = ( n_samples*mean_gauss_1d_e + i_contd*int(i_sample/thin)*mean_gauss_1d_e_previous )/(n_samples + i_contd*int(i_sample/thin))
+            np.savetxt(f'{save_base}_gauss_1d_e_mean_chain{i_chain}.dat', mean_gauss_1d_e)
+
+        for param in min_pe_params:
+            print(f'min_pe_sample[{param}][{c}]', min_pe_samples[param][c].shape, file=sys.stderr)
+            if param=='gauss_1d':
+                np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain_}.dat', min_pe_samples[param][c])
+            elif param=='gauss_1d_e':
+                np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain_}.dat', min_pe_samples[param][c])
+            else:
+                np.savetxt(f'{save_base}_{param}_min_pe_chain{i_chain_}.dat', np.array([min_pe_samples[param][c]]))
 
     if i_contd > 0:
-        os.remove(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl')
-    #if i_chain > 0:
-    #    os.remove(f'{save_base}_{i_chain}_{mcmc_seed}_warmup_state.pkl')
+        for c in range(n_chains):
+            i_chain_ = i_chain + c
+            os.remove(f'{save_base}_{i_chain_}_{i_contd}_last_state.pkl')
+
+
+def split_hmc_state_by_chain(hmc_state, num_chains):
+    """
+    split batched HMCState by each chain and return it as list
+    """
+    single_chain_states = []
+
+    if num_chains == 1:
+        single_chain_states.append(hmc_state)
+    else:
+        for c in range(num_chains):
+            # assign tree_map for each field
+            def select_chain(x):
+                if hasattr(x, 'shape') and x.shape[0] == num_chains:
+                    return x[c]
+                else:
+                    return x
+
+            single_chain_state = tree_map(select_chain, hmc_state)
+            single_chain_states.append(single_chain_state)
+
+    return single_chain_states
+
+def merge_hmc_states(multi_state, single_state, i_chain):
+    """
+    multi_state: HMCState (batched, num_chains >= 2)
+    single_state: HMCState (num_chain == 1)
+    i_chain: int
+    """
+
+    def _update(multi_val, single_val):
+        """
+        multi_val: array (or pytree leaf) with shape=(num_chains, ...)
+        single_val: array woth shape=(...) 
+        """
+        # replace if multi_val is array with shape = (num_chains, ...)
+        if (hasattr(multi_val, 'shape') 
+            and len(multi_val.shape) >= 1 
+            and multi_val.shape[0] > i_chain):
+            new_arr = jnp.array(multi_val)
+            #new_arr[i_chain] = jnp.array(single_val)
+            new_arr = new_arr.at[i_chain].set(jnp.array(single_val))
+            return new_arr
+        else:
+            return multi_val
+
+    new_multi_state = tree_map(_update, multi_state, single_state)
+    return new_multi_state
