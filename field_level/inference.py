@@ -9,9 +9,6 @@ if jax.config.read('jax_enable_x64'):
     numpyro.enable_x64()
     print('NumPyro x64 mode is enabled because JAX is in x64 mode.', file=sys.stderr)
 
-num_local_devices = jax.local_device_count()
-numpyro.set_host_device_count(num_local_devices)
-
 import jax.numpy as jnp
 from jax import random
 import jax.scipy as jsp
@@ -122,6 +119,7 @@ def field_inference(boxsize, redshift, which_pk,
     print(which_ics, file=sys.stderr)
     window_order, interlace = mas_params
     i_chain, n_chains, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
+    numpyro.set_host_device_count(n_chains)
     if i_contd > 0:
         n_warmup = 1
     if 'fixed_log_Perr' in err_params.keys():
