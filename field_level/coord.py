@@ -194,11 +194,27 @@ def indep_coord_stack(ng):
     
     return idx_conjugate_re, idx_conjugate_im
 
-def kmax_modes(ng, boxsize, kmax):
+def above_kmax_modes(ng, boxsize, kmax):
     kvec = rfftn_kvec([ng,]*3, boxsize)
     k2 = rfftn_k2(kvec)
     num = k2.size
     return jnp.array(jnp.where(jnp.sqrt(k2.reshape(num)) > kmax))[0]
+
+def below_kmax_modes(ng, boxsize, kmax):
+    kvec = rfftn_kvec([ng,]*3, boxsize)
+    k2 = rfftn_k2(kvec)
+    num = k2.size
+    return jnp.array(jnp.where(jnp.sqrt(k2.reshape(num)) <= kmax))[0]
+
+def above_kmax_modes_3d(ng, boxsize, kmax):
+    kvec = rfftn_kvec([ng,]*3, boxsize)
+    k2 = rfftn_k2(kvec)
+    return jnp.array(jnp.where(jnp.sqrt(k2) > kmax))
+
+def below_kmax_modes_3d(ng, boxsize, kmax):
+    kvec = rfftn_kvec([ng,]*3, boxsize)
+    k2 = rfftn_k2(kvec)
+    return jnp.array(jnp.where(jnp.sqrt(k2) <= kmax))
 
 def independent_modes_re_im(deltak_1d, idx_conjugate):
     ### delete conjugate in c=0 & c=ng/2 plane
