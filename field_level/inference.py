@@ -45,10 +45,13 @@ gpus = jax.devices('gpu')
 DEFAULT_I_SAMPLE = 100
 MAX_WARMUP_ITERS = 10  # For preventing infinite warmup loop
 
+LN1010AS_TRUE = 3.047
 OMEGA_B_TRUE = 0.02242
 OMEGA_C_TRUE = 0.11933
 HUBBLE_TRUE = 0.73
 NS_TRUE = 0.9665
+
+K_NL = 0.2  # Non-linear scale in h/Mpc, can be adjusted based on cosmology
 
 # -----------------------------
 # Helper Functions
@@ -64,14 +67,14 @@ def sample_uniform_deterministic(param_name, scaled_name, bounds):
 
 def check_dense_mass_matrix(inv_mass_matrix, dense_mass, criteria=0.9):
     """
-    Check each parameter (except 'c0', 'c2', 'c4') in the mass matrix block corresponding to dense_mass.
+    Check each parameter (except 'c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2') in the mass matrix block corresponding to dense_mass.
     Returns an index mapping and a boolean indicating if any diagonal value exceeds the criteria.
     """
     block = inv_mass_matrix[dense_mass]
     check_fail = False
     index_map = {}
     for i, param in enumerate(dense_mass):
-        if param in ['c0', 'c2', 'c4']:
+        if param in ['c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2']:
             continue
         index_map[param] = i
         diag_val = jnp.abs(block[:, i, i])
@@ -82,37 +85,35 @@ def check_dense_mass_matrix(inv_mass_matrix, dense_mass, criteria=0.9):
             logger.info(f'Parameter {param} (index {i}) OK: diag value {diag_val}')
     return index_map, check_fail
 
+def tree_block_until_ready(tree):
+    """
+    Recursively call `.block_until_ready()` on every leaf that has it.
+    Ensures all device computations (GPU/TPU) are completed.
+    """
+    return tree_map(
+        lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+        tree,
+    )
+
 def split_hmc_state_by_chain(hmc_state, num_chains):
     """
+    HMCState (batched) → [HMCState(chain=0), …, HMCState(chain=N-1)]
     Split a batched HMCState by each chain and return as a list.
     """
-    single_chain_states = []
     if num_chains == 1:
-        single_chain_states.append(hmc_state)
-    else:
-        for c in range(num_chains):
-            def select_chain(x):
-                if hasattr(x, 'shape') and x.shape[0] == num_chains:
-                    return x[c]
-                else:
-                    return x
-            single_chain_state = tree_map(select_chain, hmc_state)
-            single_chain_states.append(single_chain_state)
-    return single_chain_states
+        return [hmc_state]
 
-def merge_hmc_states(multi_state, single_state, i_chain):
+    def select(x, idx):
+        return x[idx] if (hasattr(x, "shape") and x.shape[:1] == (num_chains,)) else x
+
+    return [jax.tree_map(lambda x, i=i: select(x, i), hmc_state) for i in range(num_chains)]
+
+def merge_hmc_states(per_chain_states):
     """
+    [HMCState, …] → batched HMCState
     Merge a single-chain HMCState (single_state) into multi_state at the specified chain index.
     """
-    def _update(multi_val, single_val):
-        if hasattr(multi_val, 'shape') and len(multi_val.shape) >= 1 and multi_val.shape[0] > i_chain:
-            new_arr = jnp.array(multi_val)
-            new_arr = new_arr.at[i_chain].set(jnp.array(single_val))
-            return new_arr
-        else:
-            return multi_val
-    new_multi_state = tree_map(_update, multi_state, single_state)
-    return new_multi_state
+    return tree_map(lambda *xs: jnp.stack(xs, axis=0), *per_chain_states)
 
 def load_data(data_path):
     """
@@ -142,10 +143,13 @@ def compute_pk(name: str,
     # fieldk2  : iff None → auto, else → cross against this field
     # measure_pk: Measure_Pk instance
     """
+    fk1 = lax.stop_gradient(fieldk1)
+    fk2 = lax.stop_gradient(fieldk2) if fieldk2 is not None else None
+
     if fieldk2 is None:
-        k, pk, _ = measure_pk.pk_auto(fieldk1)
+        k, pk, _ = measure_pk.pk_auto(fk1)
     else:
-        k, pk, _ = measure_pk.pk_cross(fieldk1, fieldk2)
+        k, pk, _ = measure_pk.pk_cross(fk1, fk2)
     # stack k and pk so the user can inspect both
     out = jnp.stack([k.real, pk.real], axis=0)
     numpyro.deterministic(name, out)
@@ -249,7 +253,7 @@ def field_inference(boxsize, redshift, which_pk,
     i_chain, n_chains, thin, n_samples, n_warmup, accept_rate, mcmc_seed, i_contd = mcmc_params
     numpyro.set_host_device_count(n_chains)
     if i_contd > 0:
-        n_warmup = 1
+        n_warmup = 0
 
     ### flags for pk_ic computations
     if isinstance(pk_params, (list, tuple)) and len(pk_params)==3:
@@ -376,7 +380,7 @@ def field_inference(boxsize, redshift, which_pk,
     logger.info('data_1d_ind.shape = %s', data_1d_ind.shape)
 
     # Calculate k2 and mu2 for k_space
-    k_NL = 0.1
+    k_NL = K_NL
     if which_space == 'k_space':
         if kmax > 1.0:
             kvec = coord.rfftn_kvec([ng_max]*3, boxsize)
@@ -415,12 +419,13 @@ def field_inference(boxsize, redshift, which_pk,
                 omega_b = sample_uniform_deterministic('ob', 'scaled_ob', cosmo_params['ob'])
             else:
                 omega_b = 0.02242
-            OM = numpyro.deterministic('OM', (omega_b + omega_c) / hubble**2)
+            if 'oc' in cosmo_params or 'ob' in cosmo_params or 'hubble' in cosmo_params:
+                OM = numpyro.deterministic('OM', (omega_b + omega_c) / hubble**2)
             if 'ns' in cosmo_params:
                 ns = sample_uniform_deterministic('ns', 'scaled_ns', cosmo_params['ns'])
             else:
                 ns = 0.9665
-            ln1010As = 3.047
+            ln1010As = LN1010AS_TRUE
             cosmo_params_local = jnp.array([omega_b, omega_c, hubble, ns, ln1010As, 0.0])
             if 'sigma8' in cosmo_params:
                 min_sigma8, max_sigma8 = cosmo_params['sigma8']
@@ -565,10 +570,16 @@ def field_inference(boxsize, redshift, which_pk,
                 Perr = (vol/fixed_log_Perr)**3
             else:
                 Perr = jnp.exp(fixed_log_Perr)
+        if 'Perr_k2' in err_params:
+            mean_Perr_k2 = err_params['Perr_k2'][0]
+            std_Perr_k2 = err_params['Perr_k2'][1]
+            Perr_k2 = numpyro.sample("Perr_k2", dist.Normal(mean_Perr_k2, std_Perr_k2))
+            Perr = Perr + Perr*Perr_k2*k2_1d_ind
+                
         if which_space == 'k_space':
             sigma_err = jnp.sqrt(Perr / (2. * vol))
         elif which_space == 'r_space':
-            sigma2_err = Perr * ng3 / vol
+            sigma2_err = Perr * ng3_max / vol
 
         if 'log_Peded' in err_params:
             log_Peded = numpyro.sample("log_Peded", dist.Normal(*err_params['log_Peded']))
@@ -577,14 +588,14 @@ def field_inference(boxsize, redshift, which_pk,
             if which_space == 'k_space':
                 sigma_eded = jnp.sqrt(Peded / (2. * vol))
             elif which_space == 'r_space':
-                sigma2_eded = Peded * ng3 / vol
+                sigma2_eded = Peded * ng3_max / vol
         elif 'fixed_log_Peded' in err_params:
             fixed_log_Peded = err_params['fixed_log_Peded']
             Peded = jnp.exp(fixed_log_Peded)
             if which_space == 'k_space':
                 sigma_eded = jnp.sqrt(Peded / (2. * vol))
             elif which_space == 'r_space':
-                sigma2_eded = Peded * ng3 / vol
+                sigma2_eded = Peded * ng3_max / vol
         if 'Peed' in err_params:
             scaled_Peed = numpyro.sample("scaled_Peed", dist.Uniform(-1, 1.))
             Peed = numpyro.deterministic("Peed", scaled_Peed * bound)
@@ -593,14 +604,14 @@ def field_inference(boxsize, redshift, which_pk,
                 Perr_eff = numpyro.deterministic("Perr_eff", Perr - Peed * Peed / Peded)
                 sigma_err = jnp.sqrt(Perr_eff / (2. * vol))
             elif which_space == 'r_space':
-                sigma2_eed = Peed * ng3 / vol
+                sigma2_eed = Peed * ng3_max / vol
         elif 'fixed_Peed' in err_params:
             Peed = jnp.exp(fixed_log_Peed)
             if which_space == 'k_space':
                 Perr_eff = numpyro.deterministic("Perr_eff", Perr - Peed * Peed / Peded)
                 sigma_err = jnp.sqrt(Perr_eff / (2. * vol))
             elif which_space == 'r_space':
-                sigma2_eed = Peed * ng3 / vol
+                sigma2_eed = Peed * ng3_max / vol
 
         if which_ics == 'varied_ics':
             delk = A * f_model.linear_modes(cosmo_params_local, gauss_3d)
@@ -640,11 +651,11 @@ def field_inference(boxsize, redshift, which_pk,
             field_model_1d_ind = independent_modes(fieldk_model)
         elif which_space == 'r_space':
             fieldr_model, delr_max, d2r_max = f_model.compute_model(delk_L, biases)
-            field_model_1d_ind = fieldr_model.reshape(ng3)
+            field_model_1d_ind = fieldr_model.reshape(ng3_max)
             if 'log_Peded' in err_params or 'fixed_log_Peded' in err_params:
-                d2r_1d_ind = d2r_max.reshape(ng3)
+                d2r_1d_ind = d2r_max.reshape(ng3_max)
             if 'Peed' in err_params or 'fixed_Peed' in err_params:
-                delr_1d_ind = delr_max.reshape(ng3)
+                delr_1d_ind = delr_max.reshape(ng3_max)
             if ('Peded' in err_params or 'fixed_Peded' in err_params or 
                 'Peed' in err_params or 'fixed_Peed' in err_params):
                 sigma2_err = sigma2_err + 2.0 * sigma2_eed * delr_1d_ind + sigma2_eded * d2r_1d_ind
@@ -659,15 +670,25 @@ def field_inference(boxsize, redshift, which_pk,
     i_sample = DEFAULT_I_SAMPLE
     i_iter = int(n_total / i_sample)
 
-    kernel = NUTS(model=model,
-                  target_accept_prob=accept_rate,
-                  adapt_step_size=True,
-                  adapt_mass_matrix=True,
-                  dense_mass=dense_mass,
-                  max_tree_depth=(9, 9),
-                  forward_mode_differentiation=False,
-                  init_strategy=numpyro.infer.init_to_sample)
-
+    if i_contd > 0:
+        kernel = NUTS(model=model,
+                      target_accept_prob=accept_rate,
+                      adapt_step_size=False,
+                      adapt_mass_matrix=True,
+                      dense_mass=dense_mass,
+                      max_tree_depth=(9, 9),
+                      forward_mode_differentiation=False,
+                      init_strategy=numpyro.infer.init_to_sample)
+    else:
+        kernel = NUTS(model=model,
+                      target_accept_prob=accept_rate,
+                      adapt_step_size=True,
+                      adapt_mass_matrix=True,
+                      dense_mass=dense_mass,
+                      max_tree_depth=(9, 9),
+                      forward_mode_differentiation=False,
+                      init_strategy=numpyro.infer.init_to_sample)
+        
     chain_method = 'sequential' if n_chains == 1 else 'parallel'
 
     # --- Initial MCMC warmup (num_samples=1) ---
@@ -680,7 +701,7 @@ def field_inference(boxsize, redshift, which_pk,
     params = list(mcmc.get_samples().keys())
     params.append('potential_energy')
     map_params = params.copy()
-    if collect_ics == 0:
+    if collect_ics == 0 and which_ics == 'varied_ics':
         params.remove('gauss_1d')
     logger.info('params = %s', params)
     logger.info('MAP_params = %s', map_params)
@@ -729,25 +750,43 @@ def field_inference(boxsize, redshift, which_pk,
         
         rng_key = jax.random.PRNGKey(1)  # use seed, not 0
         mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
+        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
+        logger.info("set-up finished and synchronized.")
+        
         logger.info('Restarting sampling...')
+        #if n_chains == 1 and i_contd == 160:
+        #    #with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
+        #    with open(f'{save_base}_7_210_last_state.pkl', 'rb') as f:
+        #        last_state = pickle.load(f)
+        #    mcmc.post_warmup_state = last_state
         if n_chains == 1:
-            with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
-            #with open(f'{save_base}_0_110_last_state.pkl', 'rb') as f:
-                last_state = pickle.load(f)
+            #if i_contd == 350:
+            #    with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
+            #        last_state = pickle.load(f)
+            if 'rsd' in model_name:
+                with open(f'{save_base}_3_400_last_state.pkl', 'rb') as f:
+                    last_state = pickle.load(f)
+            else:
+                with open(f'{save_base}_3_410_last_state.pkl', 'rb') as f:
+                    last_state = pickle.load(f)
             mcmc.post_warmup_state = last_state
         else:
+            per_chain_states = []
             for c in range(n_chains):
                 i_chain_ = i_chain + c
                 with open(f'{save_base}_{i_chain_}_{i_contd}_last_state.pkl', 'rb') as f:
-                    last_state = pickle.load(f)
-                last_state = tree_map(jnp.array, last_state)
-                mcmc.post_warmup_state = merge_hmc_states(mcmc.post_warmup_state, last_state, c)
+                    per_chain_states.append(pickle.load(f))
+            mcmc.post_warmup_state = merge_hmc_states(per_chain_states)
+        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
+        logger.info("Merged HMCState synchronized.")
         logger.info('LOADED warmup state:')
         logger.info(mcmc.post_warmup_state)
 
     elif n_warmup <= 1:
         rng_key = jax.random.PRNGKey(2)
         mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
+        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
+        logger.info("set-up finished and synchronized.")
         if n_chains == 1:
             with open(f'{save_base}_{i_chain}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
             #with open(f'{save_base}_{i_chain}_80_last_state.pkl', 'rb') as f:
@@ -755,22 +794,22 @@ def field_inference(boxsize, redshift, which_pk,
                 last_state = pickle.load(f)
             mcmc.post_warmup_state = last_state
         else:
+            per_chain_states = []
             for c in range(n_chains):
                 i_chain_ = i_chain + c
                 mcmc_seed_ = mcmc_seed + 12345 * i_chain_
                 with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
-                #with open(f'{save_base}_{i_chain_}_50_last_state.pkl', 'rb') as f:
-                #with open(f'{save_base}_0_50_last_state.pkl', 'rb') as f:
-                    warmup_state = pickle.load(f)
-                warmup_state = tree_map(jnp.array, warmup_state)
-                mcmc.post_warmup_state = merge_hmc_states(mcmc.post_warmup_state, warmup_state, c)
-            logger.info('LOADED warmup state:')
-            logger.info(mcmc.post_warmup_state)
+                    per_chain_states.append(pickle.load(f))
+            mcmc.post_warmup_state = merge_hmc_states(per_chain_states)
+        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
+        logger.info('LOADED warmup state:')
+        logger.info(mcmc.post_warmup_state)
     else:
         mcmc_seed += 12345 * i_chain
         rng_key = jax.random.PRNGKey(mcmc_seed)
         logger.info(f'rng_seed = {mcmc_seed}')
         mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
+        tree_block_until_ready(mcmc.post_warmup_state)
         logger.info('post_warmup_state:')
         logger.info(mcmc.post_warmup_state)
         inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
@@ -783,13 +822,12 @@ def field_inference(boxsize, redshift, which_pk,
         logger.info(f'inv_mass_matrix = {inv_mass_matrix}')
         index_map, check_fail = check_dense_mass_matrix(inv_mass_matrix, dense_mass[0], criteria)
         logger.info(f'Initial dense mass matrix check: check_fail={check_fail}')
-        post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
-        chain_warmup_states = split_hmc_state_by_chain(post_warmup_state, n_chains)
-        for c in range(n_chains):
+        chain_warmup_states = split_hmc_state_by_chain(mcmc.post_warmup_state, n_chains)
+        for c, st in enumerate(chain_warmup_states):
             i_chain_ = i_chain + c
             mcmc_seed_ = mcmc_seed + 12345 * i_chain_
             with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'wb') as f:
-                pickle.dump(chain_warmup_states[c], f)
+                pickle.dump(st, f)
         warmup_iter = 0
         # Use proper key splitting inside the warmup loop
         while check_fail:
@@ -799,20 +837,26 @@ def field_inference(boxsize, redshift, which_pk,
                 sys.exit(1)
             rng_key, subkey = jax.random.split(rng_key)
             logger.info(f'Warmup iteration: {warmup_iter}')
-            mcmc.warmup(subkey, obs_data=data_1d_ind, extra_fields=('potential_energy',))
+            mcmc.warmup(subkey, obs_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
+            tree_block_until_ready(mcmc.post_warmup_state)
             inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
             if n_chains == 1:
                 inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None, :, :]
             i_warmup += 1
             index_map, check_fail = check_dense_mass_matrix(inv_mass_matrix, dense_mass[0], criteria)
             logger.info(f'After warmup iteration {i_warmup}: check_fail={check_fail}')
-            post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
-            chain_warmup_states = split_hmc_state_by_chain(post_warmup_state, n_chains)
-            for c in range(n_chains):
+            #post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
+            chain_warmup_states = split_hmc_state_by_chain(mcmc.post_warmup_state, n_chains)
+            for c, st in enumerate(chain_warmup_states):
                 i_chain_ = i_chain + c
                 mcmc_seed_ = mcmc_seed + 12345 * i_chain_
-                with open(f'{save_base}_{i_chain_}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
-                    pickle.dump(chain_warmup_states[c], f)
+                with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'wb') as f:
+                    pickle.dump(st, f)
+            #for c in range(n_chains):
+            #    i_chain_ = i_chain + c
+            #    mcmc_seed_ = mcmc_seed + 12345 * i_chain_
+            #    with open(f'{save_base}_{i_chain_}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
+            #        pickle.dump(chain_warmup_states[c], f)
         logger.info(f'Final dense mass matrix check passed after {i_warmup} warmup iterations.')
 
     # -----------------------------
@@ -821,15 +865,29 @@ def field_inference(boxsize, redshift, which_pk,
     mean_gauss_1d = [None] * n_chains
     posterior_samples = {param: None for param in params}
 
+    #samples = mcmc.get_samples(group_by_chain=True)
+    #print(samples, file=sys.stderr)
+    #samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
+    #for param in params:
+    #    arr = samples[param].astype(np.float32)  # shape (chains, batch_size)
+    #    if posterior_samples[param] is None:
+    #        posterior_samples[param] = arr
+    #    else:
+    #        posterior_samples[param] = jnp.concatenate([posterior_samples[param], 
+    #                                                    arr], 
+    #                                                    axis=1)
+
+
     for i in range(i_iter):
         logger.info("running batch %d ...", i)
-        # Split rng_key for each MCMC run
-        rng_key = jax.random.PRNGKey(mcmc_seed+12*i_chain+1234*i+12345*i_contd)
+        rng_key = jax.random.PRNGKey(mcmc_seed+10*i_chain+1234*i+12345*i_contd)
         rng_key, run_key = jax.random.split(rng_key)
         mcmc.run(run_key,
         #mcmc.run(mcmc.post_warmup_state.rng_key,
                  obs_data=data_1d_ind,
+                 #collect_warmup = True,
                  extra_fields=('potential_energy',))
+        tree_block_until_ready(mcmc.last_state)
         samples = mcmc.get_samples(group_by_chain=True)
         samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
         
@@ -864,9 +922,10 @@ def field_inference(boxsize, redshift, which_pk,
         # Save last state at final batch
         if i == i_iter - 1:
             i_last = i + i_contd + 1
-            for c in range(n_chains):
-                with open(f'{save_base}_{i_chain + c}_{i_last}_last_state.pkl', 'wb') as f:
-                    pickle.dump(split_hmc_state_by_chain(last_state, n_chains)[c], f)
+            chain_states = split_hmc_state_by_chain(last_state, n_chains)
+            for c, st in enumerate(chain_states):
+                with open(f'{save_base}_{i_chain+c}_{i_last}_last_state.pkl', 'wb') as f:
+                    pickle.dump(st, f)
         
         '''
         if i == 0:

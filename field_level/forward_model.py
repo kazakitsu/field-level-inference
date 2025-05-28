@@ -24,10 +24,12 @@ class Forward_Model:
         elif len(ng_params) == 4:
             self.ng, self.ng_L, self.ng_E, self.ng_max = ng_params
         self.ngo2 = self.ng // 2
+        self.ng3  = self.ng*self.ng*self.ng
         self.ng3_L = self.ng_L*self.ng_L*self.ng_L
         self.ng3_E = self.ng_E*self.ng_E*self.ng_E
         self.ngo2_E = self.ng_E // 2
         self._zeros_E = jnp.zeros((self.ng_E,)*3) # cached zero field
+        self._norm    = float(self.ng**3)
         self._norm_L  = float(self.ng_L**3)
         self._norm_E  = float(self.ng_E**3)
 
@@ -37,6 +39,7 @@ class Forward_Model:
         self.space = space
         self.rsd_flag = False
         self.renormalize = True
+        self.n_max = kwargs.get('n_max', 1)
 
         # batch FFT kernels (static vmap)
         self._irfftn_b = vmap(jnp.fft.irfftn, in_axes=0, out_axes=0)
@@ -45,9 +48,11 @@ class Forward_Model:
         print('model = ', self.model_name, file=sys.stderr)
         if   'gauss'     in model_name: self._branch = 0
         elif '1ept_G2'   in model_name: self._branch = 1
-        elif '2ept'      in model_name: self._branch = 2
-        elif 'lpt'       in model_name: self._branch = 3
-        else:                           self._branch = 4   # fall‑back
+        elif '1ept_d2'   in model_name: self._branch = 2
+        elif '2ept'      in model_name: self._branch = 3
+        elif 'lpt'       in model_name: self._branch = 4
+        elif 'gridspt'   in model_name: self._branch = 5
+        else:                           self._branch = 6   # fall‑back
 
         ### LPT pre-initial position
         pos_base_L = jnp.linspace(0, self.boxsize, self.ng_L, endpoint=False)
@@ -93,9 +98,16 @@ class Forward_Model:
             print('renormalize = False', file=sys.stderr)
             self.renormalize = False
 
+    def _rescale(self, array3d):
+        # ng_E<=ng_L: reduce else: extend
+        return (coord.func_reduce(self.ng_E, array3d)
+                if self.ng_E <= self.ng_L
+                else coord.func_extend(self.ng_E, array3d))
+
     def kvecs(self, kmax):
         self.kvec = coord.rfftn_kvec([self.ng,]*3, self.boxsize, dtype=float)
         self.k2   = coord.rfftn_k2(self.kvec)
+        self.kG1  = coord.rfftn_G1(self.kvec)
 
         self.kvec_E = coord.rfftn_kvec([self.ng_E,]*3, self.boxsize, dtype=float)
         self.k2_E   = coord.rfftn_k2(self.kvec_E)
@@ -370,10 +382,7 @@ class Forward_Model:
             kaiser_fac = b1 + growth_f * self.mu2_E
         else:
             kaiser_fac = b1
-        if self.ng_E < self.ng_L:
-            fieldk_E = kaiser_fac * coord.func_reduce(self.ng_E, delk_L)
-        else:
-            fieldk_E = kaiser_fac * coord.func_extend(self.ng_E, delk_L)
+        fieldk_E = self._rescale(delk_L)
         return fieldk_E
 
     def _compute_1ept_G2_model(self, delk_L, biases):
@@ -382,8 +391,10 @@ class Forward_Model:
         """
         G2r_L = self.G2r(delk_L)
         G2k_L = jnp.fft.rfftn(G2r_L) / self.ng3_L
-        delk_E = coord.func_reduce(self.ng_E, delk_L)
-        G2k_E = coord.func_reduce(self.ng_E, G2k_L)
+        delk_E = self._rescale(delk_L)
+        G2k_E = self._rescale(G2k_L)
+        #delk_E = coord.func_reduce(self.ng_E, delk_L)
+        #G2k_E = coord.func_reduce(self.ng_E, G2k_L)
         if 'lin' in self.model_name:
             b1 = biases[0]
         else:
@@ -394,6 +405,112 @@ class Forward_Model:
         else:
             kaiser_fac = b1
         fieldk_E = kaiser_fac * (delk_E + G2k_E)
+        return fieldk_E
+
+    def _compute_1ept_d2_model(self, delk_L, biases):
+        """
+        Compute the field for a '1ept_d2' model.
+        """
+        delr_L = jnp.fft.irfftn(delk_L) * self.ng3_L
+        d2k_L = jnp.fft.rfftn(self.d2r(delr_L)) / self.ng3_L
+
+        delk_E = self._rescale(delk_L)
+        d2k_E = self._rescale(d2k_L)
+        #delk_E = coord.func_reduce(self.ng_E, delk_L)
+        #d2k_E = coord.func_reduce(self.ng_E, d2k_L)
+        if 'lin' in self.model_name:
+            b1 = biases[0]
+            b2 = -0.5
+        elif 'quad' in self.model_name:
+            b1 = biases[0]
+            b2 = biases[1]
+        else:
+            b1 = 1.0
+            b2 = -0.5
+        if 'rsd' in self.model_name:
+            growth_f = biases[-1]
+            kaiser_fac = b1 + growth_f * self.mu2_E
+        else:
+            kaiser_fac = b1
+        fieldk_E = kaiser_fac * delk_E + 0.5 * b2 * d2k_E
+        return fieldk_E
+
+    def _compute_gridspt_model(self, delk_L):
+
+        delk = coord.func_reduce(self.ng, delk_L)
+        delr_list = [ jnp.fft.irfftn(delk) * self.ng3 ]
+        ther_list = [ jnp.fft.irfftn(delk) * self.ng3 ]
+
+        _func_extend_1 = vmap(lambda arr: coord.func_extend(self.ng_L, arr), in_axes=0)
+        _func_extend_2 = vmap(_func_extend_1, in_axes=0)
+
+        inv_k2 = jnp.where(self.k2 == 0.0, 0.0, 1.0 / self.k2)  # avoid division by zero
+
+        for n in range(2, self.n_max+1): # n = 2, ..., n_max
+
+            S_delta = jnp.zeros((self.ng_L,)*3)
+            S_theta = jnp.zeros((self.ng_L,)*3)
+
+            for m in range(1, n): # m =1, ..., n-1
+                delr_m = delr_list[m-1]
+                ther_m = ther_list[m-1]
+                ther_nm = ther_list[n-m-1]
+
+                dk_m = coord.func_extend(self.ng_L, jnp.fft.rfftn(delr_m) / self.ng3 )
+                d_m = jnp.fft.irfftn(dk_m) * self.ng3_L
+
+                tk_nm = coord.func_extend(self.ng_L, jnp.fft.rfftn(ther_nm) / self.ng3 )
+                t_nm = jnp.fft.irfftn(tk_nm) * self.ng3_L
+
+                # --- velocity field ---------------------------------------
+                uk_m  = -1j * self.kvec * jnp.fft.rfftn(ther_m)   / self.ng3 * inv_k2  # (3,k)
+                uk_nm = -1j * self.kvec * jnp.fft.rfftn(ther_nm) / self.ng3 * inv_k2
+
+                u_m  = self.batch_irfftn(_func_extend_1(uk_m))   # (3, r)
+                u_nm = self.batch_irfftn(_func_extend_1(uk_nm))
+
+                ### grad delta_m, theta_{n-m}
+                gdk_m  = 1j * self.kvec * jnp.fft.rfftn(delr_m)   / self.ng3
+                gtk_nm = 1j * self.kvec * jnp.fft.rfftn(ther_nm) / self.ng3
+
+                grad_d_m  = self.batch_irfftn(_func_extend_1(gdk_m))   # (3, r)
+                grad_t_nm = self.batch_irfftn(_func_extend_1(gtk_nm))
+
+                # grad_k u_m^k tensor
+                duk_m = self.kG1 * jnp.fft.rfftn(ther_m) / self.ng3
+                duk_nm = self.kG1 * jnp.fft.rfftn(ther_nm) / self.ng3
+
+                du_m  = self.batch_irfftn(_func_extend_1(duk_m))        
+                du_nm = self.batch_irfftn(_func_extend_1(duk_nm))
+
+                ### 0: xx, 1: xy, 2: xz, 3: yy, 4: yz, 5: zz
+                trace = du_m[0]*du_nm[0] + du_m[3]*du_nm[3] + du_m[5]*du_nm[5] + 2*( du_m[1]*du_nm[1] + du_m[2]*du_nm[2] + du_m[4]*du_nm[4] )
+
+                # interaction term
+                S_delta += (grad_d_m * u_nm).sum(0) + d_m*t_nm
+                S_theta += trace + (u_m*grad_t_nm).sum(0)
+
+            coef = 2.0 / ((2*n + 3)*(n-1))
+            delta_n = coef * ((n + 0.5)*S_delta + S_theta)
+            theta_n = coef * (1.5*S_delta + n*S_theta)
+
+            delk_n = coord.func_reduce(self.ng, jnp.fft.rfftn(delta_n) / self.ng3_L)
+            thek_n = coord.func_reduce(self.ng, jnp.fft.rfftn(theta_n) / self.ng3_L)
+            
+            delr_n = jnp.fft.irfftn(delk_n) * self.ng3
+            ther_n = jnp.fft.irfftn(thek_n) * self.ng3
+
+            delr_list.append(delr_n)
+            ther_list.append(ther_n)
+
+        delr_tot = sum(delr_list)
+
+        if self.ng_E < self.ng:
+            fieldk_E = coord.func_reduce(self.ng_E, jnp.fft.rfftn(delr_tot) / self.ng3)
+        else:
+            fieldk_E = coord.func_extend(self.ng_E, jnp.fft.rfftn(delr_tot) / self.ng3)
+
+        #return fieldk_E, delr_list
         return fieldk_E
 
     def _compute_2ept_model(self, delk_L, biases):
@@ -409,10 +526,15 @@ class Forward_Model:
         G2r_L = self.G2r(delk_L)
         G2k_L = jnp.fft.rfftn(G2r_L) / self.ng3_L
         
-        delk_E = coord.func_reduce(self.ng_E, delk_L)
-        d2k_E = coord.func_reduce(self.ng_E, d2k_L)
-        shift2k_E = coord.func_reduce(self.ng_E, shift2k_L)
-        G2k_E = coord.func_reduce(self.ng_E, G2k_L)
+        delk_E = self._rescale(delk_L)
+        G2k_E = self._rescale(G2k_L)
+        d2k_E = self._rescale(d2k_L)
+        shift2k_E = self._rescale(shift2k_L)
+
+        #delk_E = coord.func_reduce(self.ng_E, delk_L)
+        #d2k_E = coord.func_reduce(self.ng_E, d2k_L)
+        #shift2k_E = coord.func_reduce(self.ng_E, shift2k_L)
+        #G2k_E = coord.func_reduce(self.ng_E, G2k_L)
         
         if 'lin' in self.model_name:
             b1 = biases[0]
@@ -511,7 +633,7 @@ class Forward_Model:
                 weight += b1 * delr_L
                 fieldk_E = self.L2E(weight, pos_x)
         else:  ### matter
-            factor_lin = 0.0
+            factor_lin = 1.0
             if 'c0' in self.model_name:
                 c0 = biases[0]
                 factor_lin += c0 * self.k2_E
@@ -530,22 +652,29 @@ class Forward_Model:
         def _gauss(_):
             return self._compute_gauss_model(delk_L, biases)
 
-        def _1ept(_):
+        def _1ept_G2(_):
             return self._compute_1ept_G2_model(delk_L, biases)
+        
+        def _1ept_d2(_):
+            return self._compute_1ept_d2_model(delk_L, biases)
 
         def _2ept(_):
             return self._compute_2ept_model(delk_L, biases)
 
         def _lpt(_):
             return self._compute_lpt_model(delk_L, biases)
+        
+        def _gridspt(_):
+            return self._compute_gridspt_model(delk_L,)
 
         # fallback
         def _dummy(_):
-            return jnp.zeros_like(coord.func_reduce(self.ng_E, delk_L))
+            return jnp.zeros_like(self._rescale(delk_L))
+            #return jnp.zeros((self.ng_E, )*3) + 1j*0.
 
         fieldk_E = lax.switch(
             self._branch,                     # static
-            (_gauss, _1ept, _2ept, _lpt, _dummy),
+            (_gauss, _1ept_G2, _1ept_d2, _2ept, _lpt, _gridspt, _dummy),
             operand=None                      
         )
 
@@ -554,6 +683,9 @@ class Forward_Model:
             return fieldk_E
         elif self.space == 'r_space':
             fieldk_E = fieldk_E.at[0,0,0].set(0.0)
+            if 'Sigma2' in self.model_name:
+                Sigma2 = biases[-1]
+                fieldk_E = fieldk_E * jnp.exp(-0.5 * Sigma2 * self.k2_E)
             ng3_max = self.ng_max ** 3
             fieldk_max = coord.func_reduce(self.ng_max, fieldk_E)
             fieldr_max = jnp.fft.irfftn(fieldk_max) * ng3_max

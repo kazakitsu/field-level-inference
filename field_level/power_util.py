@@ -250,7 +250,7 @@ class Measure_spectra_FFT:
         return lines, triangles
 
     @partial(jit, static_argnames=('self', 'batch_size'))
-    def measure_bispectrum(self, fieldk, batch_size=140):
+    def measure_bk(self, fieldk, batch_size=20):
         num_bins = len(self.kbin_1d) - 1
         kbin_centers = 0.5 * (self.kbin_1d[1:] + self.kbin_1d[:-1])
 
@@ -294,7 +294,7 @@ class Measure_spectra_FFT:
         return triangles
 
     @partial(jit, static_argnames=('self'))
-    def measure_power(self, fieldk):
+    def measure_pk(self, fieldk):
         num_bins = self.kbin_1d.shape[0] - 1
         kbin_centers = 0.5 * (self.kbin_1d[1:] + self.kbin_1d[:-1])
         onesk = jnp.ones_like(fieldk)
