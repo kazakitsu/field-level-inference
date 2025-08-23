@@ -113,7 +113,7 @@ def read_params(params_file):
                 cosmo_params[key] = parse_numeric_value(value)
             elif key in ['Ab1', 'b1', 'A2b2', 'b2', 'A3bG2d', 'bG2d',
                          'A2bG2', 'bG2', 'A3b3', 'b3', 'A3bG3', 'bG3',
-                         'A3bGamma3', 'bGamma3', 'c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2']:
+                         'A3bGamma3', 'bGamma3', 'c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2', 'Sigma2_mu4']:
                 bias_params[key] = parse_numeric_value(value)
             # For err parameters. For log_Perr and log_Peded, use tuple if two numbers provided.
             elif key in ['log_Perr', 'log_Peded', 'Perr_k2', 'log_Perr_k2mu2',]:

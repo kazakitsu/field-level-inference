@@ -39,7 +39,6 @@ if jax.config.read('jax_enable_x64'):
 
 logger.info(f'The inference is running on {jax.default_backend()}')
 cpus = jax.devices('cpu')
-gpus = jax.devices('gpu')
 
 # Constants (can be parameterized as needed)
 DEFAULT_I_SAMPLE = 100
@@ -67,14 +66,14 @@ def sample_uniform_deterministic(param_name, scaled_name, bounds):
 
 def check_dense_mass_matrix(inv_mass_matrix, dense_mass, criteria=0.9):
     """
-    Check each parameter (except 'c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2') in the mass matrix block corresponding to dense_mass.
+    Check each parameter (except 'c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2', 'Sigma2_mu4') in the mass matrix block corresponding to dense_mass.
     Returns an index mapping and a boolean indicating if any diagonal value exceeds the criteria.
     """
     block = inv_mass_matrix[dense_mass]
     check_fail = False
     index_map = {}
     for i, param in enumerate(dense_mass):
-        if param in ['c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2']:
+        if param in ['c0', 'c2', 'c4', 'Sigma2', 'Sigma2_mu2', 'Sigma2_mu4']:
             continue
         index_map[param] = i
         diag_val = jnp.abs(block[:, i, i])
@@ -227,6 +226,7 @@ def field_inference(boxsize, redshift, which_pk,
             'c4' : the coefficient to k^2 \mu^4 \delta
             'Sigma2': the coefficient in exp(-0.5 k^2 \Sigma2)
             'Sigma2_mu2' : the coefficient in exp(-0.5 k^2 \mu^2 \Sigma2)
+            'Sigma2_mu4' : the coefficient in exp(-0.5 k^2 \mu^4 \Sigma2)
         Each value should be a tuple of (min, max) or (mean, std) for prior.
 
     err_params : dict
@@ -243,7 +243,7 @@ def field_inference(boxsize, redshift, which_pk,
         The parameters whose mass matrix is full-rank.
         
     mcmc_params : (int, int, int, int, int, float, int, int)
-        (i-th chain, thinning, # of samples, # of chains, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) )
+        (i-th chain, # of chains, thinning, # of samples, # of warmup, target acceptance rate, random seed for mcmc, # of the previously collected samples (to restart) )
         # of chains can be greater than 1 only if i-th chain < 0.
 
     """
@@ -395,6 +395,7 @@ def field_inference(boxsize, redshift, which_pk,
         kvec_E = coord.rfftn_kvec([ng_E]*3, boxsize)
         k2_E = coord.rfftn_k2(kvec_E)
         mu2_E = kvec_E[2]**2 / k2_E
+        mu2_E = mu2_E.at[0,0,0].set(0.0)
         del kvec_E
 
     # -----------------------------
@@ -533,6 +534,10 @@ def field_inference(boxsize, redshift, which_pk,
             Sigma2_mu2 = numpyro.sample('Sigma2_mu2', dist.Normal(*bias_params['Sigma2_mu2']))
         else:
             Sigma2_mu2 = 0.0
+        if 'Sigma2_mu4' in bias_params:
+            Sigma2_mu4 = numpyro.sample('Sigma2_mu4', dist.Normal(*bias_params['Sigma2_mu4']))
+        else:
+            Sigma2_mu4 = 0.0
 
         if 'lin' in model_name:
             biases = [b1,]
@@ -552,6 +557,8 @@ def field_inference(boxsize, redshift, which_pk,
             biases += [Sigma2,]
         if 'Sigma2_mu2' in model_name:
             biases += [Sigma2_mu2,]
+        if 'Sigma2_mu4' in model_name:
+            biases += [Sigma2_mu4,]
         if 'rsd' in model_name:
             growth_f = numpyro.deterministic('growth_f', cosmo_util.growth_f_fitting(redshift, OM))
             biases += [growth_f,]
@@ -635,6 +642,8 @@ def field_inference(boxsize, redshift, which_pk,
                 
         if which_space == 'k_space':
             fieldk_model_E = f_model.compute_model(delk_L, biases)
+            if 'Sigma2_mu4' in model_name:
+                fieldk_model_E = fieldk_model_E * jnp.exp(-0.5 * Sigma2_mu4 * k2_E * mu2_E * mu2_E )
             if 'Sigma2_mu2' in model_name:
                 fieldk_model_E = fieldk_model_E * jnp.exp(-0.5 * Sigma2_mu2 * k2_E * mu2_E)
             if 'Sigma2' in model_name:
@@ -690,6 +699,16 @@ def field_inference(boxsize, redshift, which_pk,
                       init_strategy=numpyro.infer.init_to_sample)
         
     chain_method = 'sequential' if n_chains == 1 else 'parallel'
+
+    if kwargs.get('dry_run', False):
+        return dict(model=model,
+                    kernel=kernel,
+                    obs_data=data_1d_ind,
+                    mutable_state_vars=dict(
+                        f_model=f_model,
+                        k2_E = locals().get('k2_E', None),
+                        ),
+                    )
 
     # --- Initial MCMC warmup (num_samples=1) ---
     mcmc = MCMC(kernel, num_samples=1, num_warmup=1,
@@ -788,9 +807,9 @@ def field_inference(boxsize, redshift, which_pk,
         tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
         logger.info("set-up finished and synchronized.")
         if n_chains == 1:
-            with open(f'{save_base}_{i_chain}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
+            #with open(f'{save_base}_{i_chain}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
             #with open(f'{save_base}_{i_chain}_80_last_state.pkl', 'rb') as f:
-            #with open(f'{save_base}_3_10_last_state.pkl', 'rb') as f:
+            with open(f'{save_base}_4_10_last_state.pkl', 'rb') as f:
                 last_state = pickle.load(f)
             mcmc.post_warmup_state = last_state
         else:
