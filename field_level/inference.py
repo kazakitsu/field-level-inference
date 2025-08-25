@@ -5,26 +5,28 @@ import copy
 import pickle
 import logging
 import numpy as np
-from typing import Optional
+from typing import NamedTuple, Dict
+from dataclasses import dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax import random, jit, lax, pmap
-from jax.tree_util import tree_map
-import jax.scipy as jsp
-from functools import partial
+from jax import random, jit
+try:
+    tree_map = jax.tree.map
+except AttributeError:  # JAX ~ 0.4
+    from jax.tree_util import tree_map
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
-from functools import partial
 
 # Custom modules
-import field_level.coord as coord
-import field_level.forward_model as forward_model
-import field_level.util as utiil
+import field_level.idx as idx
 import field_level.cosmo_util as cosmo_util
-import field_level.power_util as power_util
+from lss_utils.spectra_util_jax import Measure_Pk
+import PT_field
+from PT_field.forward_model import LPT_Forward, EPT_Forward
 
 # Logging configuration
 logging.basicConfig(stream=sys.stderr,
@@ -36,9 +38,13 @@ logger = logging.getLogger(__name__)
 if jax.config.read('jax_enable_x64'):
     numpyro.enable_x64()
     logger.info('NumPyro x64 mode is enabled because JAX is in x64 mode.')
+    r_dtype = jnp.float64
+    c_dtype = jnp.complex128
+else:
+    r_dtype = jnp.float32
+    c_dtype = jnp.complex64 
 
 logger.info(f'The inference is running on {jax.default_backend()}')
-cpus = jax.devices('cpu')
 
 # Constants (can be parameterized as needed)
 DEFAULT_I_SAMPLE = 100
@@ -52,9 +58,72 @@ NS_TRUE = 0.9665
 
 K_NL = 0.2  # Non-linear scale in h/Mpc, can be adjusted based on cosmology
 
+@dataclass(frozen=True)
+class ModelSpec:
+    fwd_kind: str       # 'lpt' | 'ept' | 'gauss'
+    lpt_order: int      # 0 for non-LPT
+    pt_order:  int      # 0 for non-EPT/gauss
+    bias_order: int     # 0..3
+    rsd: bool
+    matter: bool
+
+class Parsed(NamedTuple):
+    spec: ModelSpec
+    tags: Dict[str, bool]  # reserved for future use
+
+def parse_model_name(model_name: str) -> Parsed:
+    name = model_name.lower()
+    rsd    = 'rsd' in name
+    matter = 'matter' in name
+
+    # bias order
+    if   'cubic' in name: bias_order = 3
+    elif 'quad'  in name: bias_order = 2
+    elif 'lin'   in name: bias_order = 1
+    else:                 bias_order = 0
+
+    # forward kind & order
+    if 'lpt' in name:
+        fwd_kind = 'lpt'
+        lpt_order = 1 if '1lpt' in name else (2 if '2lpt' in name else 1)
+        pt_order  = 0
+    elif 'ept' in name or 'gauss' in name:
+        fwd_kind = 'ept' if 'ept' in name else 'gauss'
+        pt_order  = 1 if ('1ept' in name or 'gauss' in name) else (2 if '2ept' in name else 1)
+        lpt_order = 0
+    else:
+        raise ValueError(f"Unknown model_name: {model_name}")
+
+    spec = ModelSpec(
+        fwd_kind=fwd_kind, lpt_order=lpt_order, pt_order=pt_order,
+        bias_order=bias_order, rsd=rsd, matter=matter,
+    )
+    return Parsed(spec=spec, tags={})
+
+def build_forward_model(spec: ModelSpec, *, boxsize, ng, ng_L, ng_E, mas_params, r_dtype):
+    if spec.fwd_kind == 'lpt':
+        return LPT_Forward(
+            boxsize=boxsize, ng=ng, ng_L=ng_L, ng_E=ng_E,
+            mas_cfg=mas_params, rsd=spec.rsd, lpt_order=spec.lpt_order,
+            bias_order=spec.bias_order, dtype=r_dtype
+        )
+    else:
+        return EPT_Forward(
+            boxsize=boxsize, ng=ng, ng_L=ng_L, ng_E=ng_E,
+            mas_cfg=mas_params, rsd=spec.rsd, pt_order=spec.pt_order,
+            bias_order=spec.bias_order, dtype=r_dtype
+        )
+
 # -----------------------------
 # Helper Functions
 # -----------------------------
+def make_run_key(base_seed: int, *, chain_id: int, batch_id: int, resume_iter: int) -> jax.random.PRNGKey:
+    key = random.PRNGKey(base_seed)
+    key = random.fold_in(key, chain_id)     # independent for each chain
+    key = random.fold_in(key, resume_iter)  # independent for each restart
+    key = random.fold_in(key, batch_id)     # independent for each batch within a chain
+    return key
+
 def sample_uniform_deterministic(param_name, scaled_name, bounds):
     """
     Sample a value from a Uniform distribution and record it as a deterministic value.
@@ -63,6 +132,26 @@ def sample_uniform_deterministic(param_name, scaled_name, bounds):
     scaled = numpyro.sample(scaled_name, dist.Uniform(0.0, 1.0))
     value = numpyro.deterministic(param_name, min_val + (max_val - min_val) * scaled)
     return value
+
+def draw_uniform_or_fix(name, cfg):
+    """Draw Uniform(min, max) if cfg has 2 elems; return fixed if len==1."""
+    if cfg is None:
+        return 0.0
+    if len(cfg) == 2:
+        return numpyro.sample(name, dist.Uniform(*cfg))
+    if len(cfg) == 1:
+        return cfg[0]
+    raise ValueError(f"Bad prior spec for {name}: {cfg}")
+
+def draw_normal_or_fix(name, cfg):
+    """Draw Normal(mean, std) if cfg has 2 elems; return fixed if len==1."""
+    if cfg is None:
+        return 0.0
+    if len(cfg) == 2:
+        return numpyro.sample(name, dist.Normal(*cfg))
+    if len(cfg) == 1:
+        return cfg[0]
+    raise ValueError(f"Bad prior spec for {name}: {cfg}")
 
 def check_dense_mass_matrix(inv_mass_matrix, dense_mass, criteria=0.9):
     """
@@ -84,35 +173,65 @@ def check_dense_mass_matrix(inv_mass_matrix, dense_mass, criteria=0.9):
             logger.info(f'Parameter {param} (index {i}) OK: diag value {diag_val}')
     return index_map, check_fail
 
-def tree_block_until_ready(tree):
-    """
-    Recursively call `.block_until_ready()` on every leaf that has it.
-    Ensures all device computations (GPU/TPU) are completed.
-    """
-    return tree_map(
-        lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
-        tree,
-    )
+def tree_block_until_ready(x):
+    return tree_map(lambda a: a.block_until_ready() if hasattr(a, "block_until_ready") else a, x)
+
+def tree_to_host(x):
+    return tree_map(lambda a: np.asarray(a) if isinstance(a, (jnp.ndarray, np.ndarray)) else a, x)
+
+def tree_to_device(x):
+    return tree_map(lambda a: jnp.asarray(a) if isinstance(a, np.ndarray) else a, x)
 
 def split_hmc_state_by_chain(hmc_state, num_chains):
-    """
-    HMCState (batched) → [HMCState(chain=0), …, HMCState(chain=N-1)]
-    Split a batched HMCState by each chain and return as a list.
-    """
     if num_chains == 1:
         return [hmc_state]
-
-    def select(x, idx):
-        return x[idx] if (hasattr(x, "shape") and x.shape[:1] == (num_chains,)) else x
-
-    return [jax.tree_map(lambda x, i=i: select(x, i), hmc_state) for i in range(num_chains)]
+    def select(a, i):
+        return a[i] if (hasattr(a, "shape") and a.shape[:1] == (num_chains,)) else a
+    return [tree_map(lambda a, i=i: select(a, i), hmc_state) for i in range(num_chains)]
 
 def merge_hmc_states(per_chain_states):
-    """
-    [HMCState, …] → batched HMCState
-    Merge a single-chain HMCState (single_state) into multi_state at the specified chain index.
-    """
     return tree_map(lambda *xs: jnp.stack(xs, axis=0), *per_chain_states)
+
+def _set_rng_key_on_state(state, key):
+    # numpyro.infer.mcmc.HMCState is NamedTuple
+    if hasattr(state, "_replace") and hasattr(state, "rng_key"):
+        return state._replace(rng_key=key)
+    try:
+        d = state._asdict()
+        d["rng_key"] = key
+        return type(state)(**d)
+    except Exception:
+        return state
+    
+def broadcast_state_to_chains(template_state,
+                              n_chains: int,
+                              *,
+                              base_seed: int,
+                              resume_iter: int,
+                              chain_id_start: int):
+    """
+    単一チェーンの HMCState をベースに、rng_key だけチェーンごとに変えて
+    n_chains 分の batched HMCState を作る。
+    """
+    per = []
+    for c in range(n_chains):
+        cid = chain_id_start + c
+        key = jax.random.PRNGKey(base_seed)
+        key = jax.random.fold_in(key, resume_iter)
+        key = jax.random.fold_in(key, cid)
+        st_c = _set_rng_key_on_state(template_state, key)
+        per.append(st_c)
+    return merge_hmc_states(per)
+
+def save_hmc_state(state, path: str):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(tree_to_host(state), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+def load_hmc_state(path: str):
+    with open(path, "rb") as f:
+        return tree_to_device(pickle.load(f))
 
 def load_data(data_path):
     """
@@ -130,28 +249,23 @@ def load_data(data_path):
         data = data_path
     return data
 
-def compute_pk(name: str,
-              fieldk1: jnp.ndarray,
-              fieldk2: Optional[jnp.ndarray],
-              measure_pk: power_util.Measure_Pk):
-    """
-    # Compute auto- or cross- power spectrum and record it as numpyro.deterministic.
-    #
-    # name     : the key under which to store the [2, nbin] array
-    # fieldk1  : complex FFT field for auto (or first field in cross)
-    # fieldk2  : iff None → auto, else → cross against this field
-    # measure_pk: Measure_Pk instance
-    """
-    fk1 = lax.stop_gradient(fieldk1)
-    fk2 = lax.stop_gradient(fieldk2) if fieldk2 is not None else None
+def save_samples_npz(save_file: str,
+                     samples: dict,
+                     map_samples: dict,
+                     mean_gauss_1d: np.ndarray | None):
+    arrays = {k: np.asarray(v) for k, v in samples.items()}
+    arrays.update({f"MAP_{k}": np.asarray(v) for k, v in map_samples.items()})
+    if mean_gauss_1d is not None:
+        arrays["mean_gauss_1d"] = np.asarray(mean_gauss_1d)
+    np.savez_compressed(save_file, **arrays)
 
-    if fieldk2 is None:
-        k, pk, _ = measure_pk.pk_auto(fk1)
-    else:
-        k, pk, _ = measure_pk.pk_cross(fk1, fk2)
-    # stack k and pk so the user can inspect both
-    out = jnp.stack([k.real, pk.real], axis=0)
-    numpyro.deterministic(name, out)
+def load_samples_npz(save_file: str):
+    z = np.load(save_file)
+    arrays = {k: z[k] for k in z.files}
+    samples = {k: v for k, v in arrays.items() if not (k.startswith("MAP_") or k == "mean_gauss_1d")}
+    map_samples = {k[4:]: arrays[k] for k in arrays.keys() if k.startswith("MAP_")}
+    mean_gauss_1d = arrays.get("mean_gauss_1d", None)
+    return samples, map_samples, mean_gauss_1d
 
 # -----------------------------
 # Main Inference Function
@@ -210,13 +324,16 @@ def field_inference(boxsize, redshift, which_pk,
         In which space the likelihood is evaluating; 'k_space' or 'r_space'.  ('r-space' is not implemented here though.)
         
     cosmo_params : dict
-        The cosmological parameters to sample. The keys should be
+        The cosmological parameters in the forward model. The keys should be
             'A' or 'sigma8': the amplitude of the density
             'oc' : the physical density of CDM, oc = Omega_cdm * h^2
             'hubble' : the hubble parameter
+            'ob' : the physical density of baryon, ob = Omega_b * h^2
+            'ns' : the spectral index of the primordial power spectrum
+        Each value should be a tuple of (min, max) for prior, or a single value to fix it.
     
     bias_params : dict
-        The bias parameters to sample, including the counter terms. The keys should be
+        The bias parameters in the foward model, including the counter terms. The keys should be
             'b1': the bias to \delta
             'b2': the bias to \delta^2
             'bG2': the bias to G2
@@ -227,13 +344,12 @@ def field_inference(boxsize, redshift, which_pk,
             'Sigma2': the coefficient in exp(-0.5 k^2 \Sigma2)
             'Sigma2_mu2' : the coefficient in exp(-0.5 k^2 \mu^2 \Sigma2)
             'Sigma2_mu4' : the coefficient in exp(-0.5 k^2 \mu^4 \Sigma2)
-        Each value should be a tuple of (min, max) or (mean, std) for prior.
+        Each value should be a tuple of (min, max) or (mean, std) for prior, or a single value to fix it.
 
     err_params : dict
         The error (in the likelihood) parameters to sample (or not). The keys should be
             'log_Perr' : The logarithm of the (white) noise power spectrum
-            'fixed_log_Perr' : The logarithm of the (white) noise power spectrum, and will not sample it.
-        The value of 'log_Perr' should (mean, std) for prior.
+        The value of 'log_Perr' should (mean, std) for prior, or a single value to fix it.
     
     kmax : float
         The maximum k used in the likelihood.
@@ -255,25 +371,9 @@ def field_inference(boxsize, redshift, which_pk,
     if i_contd > 0:
         n_warmup = 0
 
-    ### flags for pk_ic computations
-    if isinstance(pk_params, (list, tuple)) and len(pk_params)==3:
-        pk_nbin, pk_kmin, pk_kmax = pk_params
-        do_pk = pk_nbin is not None
-    else:
-        do_pk = False
+    assert 'log_Perr' in err_params, "err_params['log_Perr'] is required"
 
-    # Handle fixed error parameters
-    if 'fixed_log_Perr' in err_params:
-        fixed_log_Perr = err_params.pop('fixed_log_Perr')
-        logger.info(f'fixed_log_Perr = {fixed_log_Perr}')
-    if 'fixed_log_Peed' in err_params:
-        fixed_log_Peed = err_params.pop('fixed_log_Peed')
-        logger.info(f'fixed_log_Peed = {fixed_log_Peed}')
-    if 'fixed_Peded' in err_params:
-        fixed_Peded = err_params.pop('fixed_Peded')
-        logger.info(f'fixed_Peded = {fixed_Peded}')
-
-    vol = boxsize**3
+    vol = jnp.asarray(boxsize, dtype=r_dtype)**3
 
     # Load fixed initial conditions if applicable
     if which_ics != 'varied_ics':
@@ -298,55 +398,109 @@ def field_inference(boxsize, redshift, which_pk,
     logger.info('%s interlacing %s', w_str, 'on' if interlace==1 else 'off')
 
     # Unpack ng_params
-    if len(ng_params) == 3:
-        ng, ng_L, ng_E = map(int, ng_params)
-    elif len(ng_params) == 5:
-        ng, ng_L, ng_E, ng_cut, ng_e = ng_params
+    ng, ng_L, ng_E = map(int, ng_params)
     logger.info("ng = %d, ng_L = %d, ng_E = %d, kmax = %s", ng, ng_L, ng_E, kmax)
 
     ng3 = int(ng**3)
 
+    ### flags for pk_ic computations
+    if isinstance(pk_params, (list, tuple)) and len(pk_params)==3:
+        pk_nbin, pk_kmin, pk_kmax = pk_params
+        do_pk = pk_nbin is not None
+    else:
+        do_pk = False
+
     if do_pk:
-        kbin_1d = jnp.linspace(pk_kmin, pk_kmax, pk_nbin+1)
-        measure_pk = power_util.Measure_Pk(boxsize, ng, kbin_1d)
+        kbin_edges = jnp.linspace(pk_kmin, pk_kmax, pk_nbin + 1, dtype=r_dtype)
+        measure_pk = Measure_Pk(boxsize, ng, kbin_edges, ell_max=0, dtype=r_dtype)
         dummy = jnp.ones((ng, ng, ng // 2 + 1)) + 0.*1j
-        _, _, _ = measure_pk.pk_auto(dummy)
-        _, _, _ = measure_pk.pk_cross(dummy, dummy)
+        dummy_out = measure_pk(dummy)
+        dummy_out = measure_pk(dummy, dummy)
 
     # Create the forward model
-    if 'lpt' in model_name:
-        f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space, mas_params=mas_params)
+    parsed = parse_model_name(model_name)
+    spec   = parsed.spec
+    fwd_model = build_forward_model(spec,
+                                    boxsize=boxsize, ng=ng, ng_L=ng_L, ng_E=ng_E, 
+                                    mas_params=mas_params, r_dtype=r_dtype)
+    
+    gauss_1d_to_3d = idx.build_gauss_1d_to_3d(ng)
+
+    def build_batch_ic_pk_fns(measure_pk, gauss_1d_to_3d, vol, true_gk=None):
+        """Return compiled fns to compute IC P(k) on (batch, ng^3) samples.
+        If true_gk is provided (k-space complex rfftn layout), also compute cross and residual.
+        Outputs:
+            auto_fn(batch, ng3) -> (batch, 2, nbin)  where axis0=[k, P]
+            xres_fn (optional):  -> tuple of 3 arrays (auto, cross, resid), each (batch, 2, nbin)
+        """
+        def _to_k(gauss_1d):
+            # Convert 1D Gaussian to complex k-space field (rfftn layout) and scale
+            gk = gauss_1d_to_3d(gauss_1d) / jnp.sqrt(2.0 * vol)
+            return gk
+
+        def _kp(out_mat):
+            # out_mat: (nbin, 3) with columns [k_mean, Pk*vol, Nk]
+            # Return (2, nbin) stacking k and P only
+            k = out_mat[:, 0]
+            P = out_mat[:, 1]
+            return jnp.stack([k, P], axis=0)
+
+        def _one_auto(gauss_1d):
+            gk = _to_k(gauss_1d)
+            out = measure_pk(gk)          # (nbin, 3)
+            return _kp(out)               # (2, nbin)
+
+        auto_fn = jax.jit(jax.vmap(_one_auto, in_axes=0, out_axes=0))  # (batch, 2, nbin)
+
+        if true_gk is None:
+            return auto_fn, None
+
+        def _one_all(gauss_1d):
+            gk = _to_k(gauss_1d)
+            out_auto  = measure_pk(gk)            # (nbin, 3)
+            out_cross = measure_pk(gk, true_gk)   # (nbin, 3)
+            resid = gk - true_gk
+            out_resid = measure_pk(resid)         # (nbin, 3)
+            A = _kp(out_auto)
+            C = _kp(out_cross)
+            R = _kp(out_resid)
+            return (A, C, R)
+
+        xres_fn = jax.jit(jax.vmap(_one_all, in_axes=0, out_axes=(0, 0, 0)))
+        return auto_fn, xres_fn
+
+    true_gk = None
+    if do_pk and which_ics == 'varied_ics' and (true_gauss_3d is not None):
+        # true_gauss_3d must already be in k-space complex rfftn layout
+        true_gk = jnp.asarray(true_gauss_3d, dtype=c_dtype) / jnp.sqrt(2.0 * vol)
+
+    if do_pk and which_ics == 'varied_ics':
+        auto_pk_fn, xres_pk_fn = build_batch_ic_pk_fns(measure_pk, gauss_1d_to_3d, vol, true_gk=true_gk)
     else:
-        f_model = forward_model.Forward_Model(model_name, which_pk, ng_params, boxsize, which_space)
+        auto_pk_fn, xres_pk_fn = None, None
 
-    # Prepare k-vectors
-    f_model.kvecs(kmax)
-
-    # Compute indices for independent modes (for k_space)
+    # Compute indices & build gather-based extractor for independent modes
     if which_space == 'k_space':
         if kmax > 1.0:
-            kmax = int(kmax)
-            ng_max = kmax
-            idx_conjugate_real_kmax, idx_conjugate_imag_kmax = coord.indep_coord_stack(ng_max)
+            # Cubic cutoff: downsample grid, no spherical mask needed.
+            ng_max = int(kmax)
+            del_re, del_im = idx.indep_coord_stack(ng_max)  # indices to delete (conjugates)
+            indep_take, keep_re, keep_im = idx.build_indep_taker(int(ng_max), del_re, del_im)
         else:
-            idx_conjugate_real, idx_conjugate_imag = coord.indep_coord_stack(ng)
-            idx_kmax = coord.above_kmax_modes(ng, boxsize, kmax)
-            idx_conjugate_real_kmax = np.unique(np.concatenate([idx_conjugate_real, idx_kmax]))
-            idx_conjugate_imag_kmax = np.unique(np.concatenate([idx_conjugate_imag, idx_kmax]))
-        logger.info('idx_conjugate_real_kmax.shape = %s', idx_conjugate_real_kmax.shape)
-        logger.info('idx_conjugate_imag_kmax.shape = %s', idx_conjugate_imag_kmax.shape)
+            # Spherical cutoff on the full ng grid.
+            ng_max = ng
+            del_re0, del_im0 = idx.indep_coord_stack(ng)
+            # Build keep indices directly
+            keep_re, keep_im = idx.build_keep_from_delete_and_kmax(
+                ng=ng, boxsize=boxsize, kmax=kmax, del_re=del_re0, del_im=del_im0
+                )
+            indep_take, keep_re, keep_im = idx.build_indep_taker_with_keep(ng, keep_re, keep_im)
+
+        logger.info('keep_re.shape=%s, keep_im.shape=%s', tuple(keep_re.shape), tuple(keep_im.shape))
     elif which_space == 'r_space':
         kmax = int(kmax)
         ng_max = kmax
         ng3_max = ng_max**3
-
-    @jit
-    def independent_modes(fieldk):
-        fieldk_1d = fieldk.ravel()
-        fieldk_real_1d_ind = jnp.delete(fieldk_1d.real, idx_conjugate_real_kmax)
-        fieldk_imag_1d_ind = jnp.delete(fieldk_1d.imag, idx_conjugate_imag_kmax)
-        fieldk_1d_ind = jnp.hstack([fieldk_real_1d_ind, fieldk_imag_1d_ind])
-        return fieldk_1d_ind
 
     # Load the data
     data = load_data(data_path)
@@ -355,48 +509,31 @@ def field_inference(boxsize, redshift, which_pk,
     if which_space == 'k_space':
         data[0,0,0] = 0.0  # Remove DC mode
         if kmax > 1.0:
-            data_max = coord.func_reduce(ng_max, data)
-            data_1d_ind = independent_modes(data_max)
+            data_max = PT_field.func_reduce(ng_max, data)
         else:
-            if ng < ng_E:
-                data_E = coord.func_reduce(ng, data)
-            elif ng > ng_E:
-                data_E = coord.func_extend(ng, data)
-            else:
-                data_E = data
-            data_1d_ind = independent_modes(data_E)
+            data_max = data
+        data_1d_ind = indep_take(data_max)
     elif which_space == 'r_space':
         if data.shape[2] != data.shape[0]:
             logger.info('Data is in Fourier space.')
             data[0,0,0] = 0.0
-            data_ = coord.func_reduce(ng_max, data)
-            datar = jnp.fft.irfftn(data_) * (ng_max**3)
+            data_ = PT_field.func_reduce(ng_max, data)
+            datar = jnp.fft.irfftn(data_, norm='forward')
             data_1d_ind = datar.reshape(ng_max**3)
         else:
+            if data.shape[0] != ng_max:
+                data_k = jnp.fft.rfftn(data, norm='forward')
+                data_k = PT_field.func_reduce(ng_max, data_k)
+                data = jnp.fft.irfftn(data_k, norm='forward')
             data_1d_ind = data.reshape(ng_max**3)
             data_1d_ind -= data_1d_ind.mean()
-        logger.info('datar_mean = %s', data_1d_ind.mean())
+        logger.info('data_r_mean = %s', data_1d_ind.mean())
+    data_1d_ind = jnp.asarray(data_1d_ind, dtype=r_dtype)
 
     logger.info('data_1d_ind.shape = %s', data_1d_ind.shape)
 
-    # Calculate k2 and mu2 for k_space
-    k_NL = K_NL
-    if which_space == 'k_space':
-        if kmax > 1.0:
-            kvec = coord.rfftn_kvec([ng_max]*3, boxsize)
-        else:
-            kvec = coord.rfftn_kvec([ng]*3, boxsize)
-        k2 = coord.rfftn_k2(kvec)
-        k2_1d_ind = independent_modes(k2) / (k_NL**2)
-        k2 = k2.at[0,0,0].set(1.0)
-        mu2 = kvec[2]**2 / k2
-        mu2_1d_ind = independent_modes(mu2)
-    if 'Sigma2' in model_name:
-        kvec_E = coord.rfftn_kvec([ng_E]*3, boxsize)
-        k2_E = coord.rfftn_k2(kvec_E)
-        mu2_E = kvec_E[2]**2 / k2_E
-        mu2_E = mu2_E.at[0,0,0].set(0.0)
-        del kvec_E
+    # prepare the linear P(k) generator
+    pk_lin_gen = cosmo_util.Pk_Provider()
 
     # -----------------------------
     # Model definition
@@ -404,184 +541,196 @@ def field_inference(boxsize, redshift, which_pk,
     def model(obs_data):
         if which_ics == 'varied_ics':
             gauss_1d = numpyro.sample("gauss_1d", dist.Normal(0.0, 1.0), sample_shape=(ng3,))
-            gauss_3d = coord.gauss_1d_to_3d(gauss_1d, ng)
-        # The sampling for cosmo_params, bias_params, err_params
+            gauss_3d = gauss_1d_to_3d(gauss_1d)
+        else:
+            gauss_3d = jnp.asarray(true_gauss_3d, dtype=c_dtype)
+
         if 'cosmo' in which_pk:
-            if 'oc' in cosmo_params:
+            if len(cosmo_params['oc']) == 2:
                 omega_c = sample_uniform_deterministic('oc', 'scaled_oc', cosmo_params['oc'])
+            elif len(cosmo_params['oc']) == 1:
+                omega_c = cosmo_params['oc'][0]
             else:
-                omega_c = 0.11933
-            if 'hubble' in cosmo_params:
+                omega_c = OMEGA_C_TRUE
+
+            if len(cosmo_params['hubble']) == 2:
                 hubble = sample_uniform_deterministic('hubble', 'scaled_hubble', cosmo_params['hubble'])
                 H0 = numpyro.deterministic('H0', hubble * 100)
+            elif len(cosmo_params['hubble']) == 1:
+                hubble = cosmo_params['hubble'][0]
             else:
-                hubble = 0.73
-            if 'ob' in cosmo_params:
+                hubble = HUBBLE_TRUE
+
+            if len(cosmo_params['ob']) == 2:
                 omega_b = sample_uniform_deterministic('ob', 'scaled_ob', cosmo_params['ob'])
+            elif len(cosmo_params['ob']) == 1:
+                omega_b = cosmo_params['ob'][0]
             else:
-                omega_b = 0.02242
-            if 'oc' in cosmo_params or 'ob' in cosmo_params or 'hubble' in cosmo_params:
-                OM = numpyro.deterministic('OM', (omega_b + omega_c) / hubble**2)
-            if 'ns' in cosmo_params:
+                omega_b = OMEGA_B_TRUE
+
+            OM = numpyro.deterministic('OM', (omega_b + omega_c) / hubble**2)
+
+            if len(cosmo_params['ns']) == 2:
                 ns = sample_uniform_deterministic('ns', 'scaled_ns', cosmo_params['ns'])
+            elif len(cosmo_params['ns']) == 1:
+                ns = cosmo_params['ns'][0]
             else:
-                ns = 0.9665
-            ln1010As = LN1010AS_TRUE
+                ns = NS_TRUE
+
+            if 'ln1010As' in cosmo_params:
+                ln1010As = cosmo_params['ln1010As'][0]
+            else:
+                ln1010As = LN1010AS_TRUE
+
             cosmo_params_local = jnp.array([omega_b, omega_c, hubble, ns, ln1010As, 0.0])
+            pk_lin_table = pk_lin_gen.pk_lin_table(cosmo_params_local)
+
             if 'sigma8' in cosmo_params:
                 min_sigma8, max_sigma8 = cosmo_params['sigma8']
                 scaled_sigma8 = numpyro.sample('scaled_sigma8', dist.Uniform(0.0, 1.0))
                 sigma8 = numpyro.deterministic('sigma8', min_sigma8 + (max_sigma8 - min_sigma8) * scaled_sigma8)
-                pk_lin = f_model.linear_power(cosmo_params_local)
-                tmp_sigma8 = f_model.sigmaR(pk_lin)
+                pk_lin_table = pk_lin_gen.pk_lin_table(cosmo_params_local)
+                tmp_sigma8 = pk_lin_gen.sigmaR(pk_lin_table)
                 A = numpyro.deterministic('A', sigma8 / tmp_sigma8)
             elif 'A' in cosmo_params:
                 A = numpyro.sample('A', dist.Uniform(*cosmo_params['A']))
-                pk_lin = f_model.linear_power(cosmo_params_local)
-                sigma8 = numpyro.deterministic('sigma8', A * f_model.sigmaR(pk_lin))
+                pk_lin_table = pk_lin_gen.pk_lin_table(cosmo_params_local)
+                sigma8 = numpyro.deterministic('sigma8', A * pk_lin_gen.sigmaR(pk_lin_table))
             else:
                 A = 1.0
             cosmo_params_local = cosmo_params_local.at[-1].set(redshift)
-            if 'cubic' in model_name:
-                pk_lin = f_model.linear_power(cosmo_params_local)
-        elif 'pow25' in which_pk:
-            Pk_kvec = cosmo_util.pow_Pk(jnp.sqrt(k2), 2e4, -2.5)
-            Pk_kvec = Pk_kvec.at[0,0,0].set(0.0)
-            if 'A' in cosmo_params:
-                A = numpyro.sample('A', dist.Uniform(*cosmo_params['A']))
-            else:
-                A = 1.0
 
         A2 = A * A
         A3 = A * A * A
 
         # Bias parameters sampling
         if 'Ab1' in bias_params:
-            Ab1 = numpyro.sample('Ab1', dist.Uniform(*bias_params['Ab1']))
-            b1 = numpyro.deterministic('b1', Ab1 / A)
+            Ab1 = draw_uniform_or_fix('Ab1', bias_params['Ab1'])
+            b1  = numpyro.deterministic('b1', Ab1 / A)
         elif 'b1' in bias_params:
-            b1 = numpyro.sample('b1', dist.Uniform(*bias_params['b1']))
+            b1  = draw_uniform_or_fix('b1', bias_params['b1'])
             Ab1 = numpyro.deterministic('Ab1', A * b1)
         else:
-            b1 = 1.0
+            b1  = 1.0
+            Ab1 = numpyro.deterministic('Ab1', A * b1)
+
         if 'A2b2' in bias_params:
-            A2b2 = numpyro.sample('A2b2', dist.Normal(*bias_params['A2b2']))
-            b2 = numpyro.deterministic('b2', A2b2 / A2)
+            A2b2 = draw_normal_or_fix('A2b2', bias_params['A2b2'])
+            b2   = numpyro.deterministic('b2', A2b2 / A2)
         elif 'b2' in bias_params:
-            b2 = numpyro.sample('b2', dist.Normal(*bias_params['b2']))
+            b2 = draw_normal_or_fix('b2', bias_params['b2'])
             A2b2 = numpyro.deterministic('A2b2', A2 * b2)
         else:
-            b2 = 0.0
+            b2   = 0.0
+            A2b2 = numpyro.deterministic('A2b2', A2 * b2)
+
         if 'A2bG2' in bias_params:
-            A2bG2 = numpyro.sample('A2bG2', dist.Normal(*bias_params['A2bG2']))
-            bG2 = numpyro.deterministic('bG2', A2bG2 / A2)
+            A2bG2 = draw_normal_or_fix('A2bG2', bias_params['A2bG2'])
+            bG2   = numpyro.deterministic('bG2', A2bG2 / A2)
         elif 'bG2' in bias_params:
-            bG2 = numpyro.sample('bG2', dist.Normal(*bias_params['bG2']))
+            bG2   = draw_normal_or_fix('bG2', bias_params['bG2'])
             A2bG2 = numpyro.deterministic('A2bG2', A2 * bG2)
         else:
-            bG2 = 0.0
+            bG2   = 0.0
+            A2bG2 = numpyro.deterministic('A2bG2', A2 * bG2)
+        
         if 'A3bGamma3' in bias_params:
-            A3bGamma3 = numpyro.sample('A3bGamma3', dist.Normal(*bias_params['A3bGamma3']))
-            bGamma3 = numpyro.deterministic('bGamma3', A3bGamma3 / A3)
+            A3bGamma3 = draw_normal_or_fix('A3bGamma3', bias_params['A3bGamma3'])
+            bGamma3   = numpyro.deterministic('bGamma3', A3bGamma3 / A3)
         elif 'bGamma3' in bias_params:
-            bGamma3 = numpyro.sample('bGamma3', dist.Normal(*bias_params['bGamma3']))
+            bGamma3   = draw_normal_or_fix('bGamma3', bias_params['bGamma3'])
             A3bGamma3 = numpyro.deterministic('A3bGamma3', A3 * bGamma3)
         else:
-            bGamma3 = 0.0
+            bGamma3   = 0.0
+            A3bGamma3 = numpyro.deterministic('A3bGamma3', A3 * bGamma3)
+
         if 'A3b3' in bias_params:
-            A3b3 = numpyro.sample('A3b3', dist.Normal(*bias_params['A3b3']))
-            b3 = numpyro.deterministic('b3', A3b3 / A3)
+            A3b3 = draw_normal_or_fix('A3b3', bias_params['A3b3'])
+            b3   = numpyro.deterministic('b3', A3b3 / A3)
         elif 'b3' in bias_params:
-            b3 = numpyro.sample('b3', dist.Normal(*bias_params['b3']))
+            b3   = draw_normal_or_fix('b3', bias_params['b3'])
             A3b3 = numpyro.deterministic('A3b3', A3 * b3)
         else:
-            b3 = 0.0
+            b3   = 0.0
+            A3b3 = numpyro.deterministic('A3b3', A3 * b3)
+
         if 'A3bG2d' in bias_params:
-            A3bG2d = numpyro.sample('A3bG2d', dist.Normal(*bias_params['A3bG2d']))
-            bG2d = numpyro.deterministic('bG2d', A3bG2d / A3)
+            A3bG2d = draw_normal_or_fix('A3bG2d', bias_params['A3bG2d'])
+            bG2d   = numpyro.deterministic('bG2d', A3bG2d / A3)
         elif 'bG2d' in bias_params:
-            bG2d = numpyro.sample('bG2d', dist.Normal(*bias_params['bG2d']))
-            bG2d = numpyro.deterministic('bG2d', A3 * bG2d)
+            bG2d   = draw_normal_or_fix('bG2d', bias_params['bG2d'])
+            A3bG2d = numpyro.deterministic('A3bG2d', A3 * bG2d)
         else:
-            bG2d = 0.0
+            bG2d   = 0.0
+            A3bG2d = numpyro.deterministic('A3bG2d', A3 * bG2d)
+
         if 'A3bG3' in bias_params:
-            A3bG3 = numpyro.sample('A3bG3', dist.Normal(*bias_params['A3bG3']))
-            bG3 = numpyro.deterministic('bG3', A3bG3 / A3)
+            A3bG3 = draw_normal_or_fix('A3bG3', bias_params['A3bG3'])
+            bG3   = numpyro.deterministic('bG3', A3bG3 / A3)
         elif 'bG3' in bias_params:
-            bG3 = numpyro.sample('bG3', dist.Normal(*bias_params['bG3']))
-            bG3 = numpyro.deterministic('bG3', A3 * bG3)
+            bG3   = draw_normal_or_fix('bG3', bias_params['bG3'])
+            A3bG3 = numpyro.deterministic('A3bG3', A3 * bG3)
         else:
             bG3 = 0.0
+            A3bG3 = numpyro.deterministic('A3bG3', A3 * bG3)
 
         # Counter terms
-        if 'c0' in bias_params:
-            c0 = numpyro.sample('c0', dist.Normal(*bias_params['c0']))
-        else:
-            c0 = -2.705611
-        if 'c2' in bias_params:
-            c2 = numpyro.sample('c2', dist.Normal(*bias_params['c2']))
-        else:
-            c2 = -11.00391
-        if 'c4' in bias_params:
-            c4 = numpyro.sample('c4', dist.Normal(*bias_params['c4']))
-        else:
-            c4 = 5.498273
-        if 'Sigma2' in bias_params:
-            Sigma2 = numpyro.sample('Sigma2', dist.Normal(*bias_params['Sigma2']))
-        else:
-            Sigma2 = 0.0
-        if 'Sigma2_mu2' in bias_params:
-            Sigma2_mu2 = numpyro.sample('Sigma2_mu2', dist.Normal(*bias_params['Sigma2_mu2']))
-        else:
-            Sigma2_mu2 = 0.0
-        if 'Sigma2_mu4' in bias_params:
-            Sigma2_mu4 = numpyro.sample('Sigma2_mu4', dist.Normal(*bias_params['Sigma2_mu4']))
-        else:
-            Sigma2_mu4 = 0.0
+        c0 = draw_normal_or_fix('c0', bias_params['c0'])
 
+        c2 = draw_normal_or_fix('c2', bias_params['c2'])
+
+        c4 = draw_normal_or_fix('c4', bias_params['c4'])
+
+        Sigma2 = draw_normal_or_fix('Sigma2', bias_params['Sigma2'])
+
+        Sigma2_mu2 = draw_normal_or_fix('Sigma2_mu2', bias_params['Sigma2_mu2'])
+
+        Sigma2_mu4 = draw_normal_or_fix('Sigma2_mu4', bias_params['Sigma2_mu4'])
+
+        # Collect all bias parameters
         if 'lin' in model_name:
-            biases = [b1,]
+            betas = [b1,]
         elif 'quad' in model_name:
-            biases = [b1, b2, bG2,]
+            betas = [b1, 0.5*b2, bG2,]
         elif 'cubic' in model_name:
-            biases = [b1, b2, bG2, b3, bG2d, bG3, bGamma3,]
+            betas = [b1, 0.5*b2, bG2, b3, bG2d, bG3, bGamma3,]
         else:
-            biases = []
-        if 'c0' in model_name:
-            biases += [c0,]
-        if 'c2' in model_name:
-            biases += [c2,]
-        if 'c4' in model_name:
-            biases += [c4,]
-        if 'Sigma2' in model_name:
-            biases += [Sigma2,]
-        if 'Sigma2_mu2' in model_name:
-            biases += [Sigma2_mu2,]
-        if 'Sigma2_mu4' in model_name:
-            biases += [Sigma2_mu4,]
+            betas = []
+
+        if isinstance(fwd_model, LPT_Forward):
+            if 'matter' in model_name:
+                betas.insert(0, 1.0)
+            else:
+                betas.insert(0, 0.0)
+
         if 'rsd' in model_name:
             growth_f = numpyro.deterministic('growth_f', cosmo_util.growth_f_fitting(redshift, OM))
-            biases += [growth_f,]
+            if 'gauss_rsd' in model_name:
+                c1 = growth_f
+            else:
+                c1 = 0.0
+        else:
+            growth_f = 0.0
+            c1 = 0.0
+
+        betas += [c0, c1, c2, c4]
+        betas = jnp.asarray(betas, dtype=r_dtype)
 
         # Error model
         if 'log_Perr' in err_params:
-            if err_params['log_Perr'][0] > 15.:
-                mean_log_Perr = jnp.log((vol/err_params['log_Perr'][0])**3)
-            else:
-                mean_log_Perr = err_params['log_Perr'][0]
-            std_log_Perr = err_params['log_Perr'][1]
-            log_Perr = numpyro.sample("log_Perr", dist.Normal(mean_log_Perr, std_log_Perr))
-            Perr = jnp.exp(log_Perr)
-        else:
-            if fixed_log_Perr > 15.:
-                Perr = (vol/fixed_log_Perr)**3
-            else:
-                Perr = jnp.exp(fixed_log_Perr)
-        if 'Perr_k2' in err_params:
-            mean_Perr_k2 = err_params['Perr_k2'][0]
-            std_Perr_k2 = err_params['Perr_k2'][1]
-            Perr_k2 = numpyro.sample("Perr_k2", dist.Normal(mean_Perr_k2, std_Perr_k2))
-            Perr = Perr + Perr*Perr_k2*k2_1d_ind
+            if len(err_params['log_Perr']) == 2:
+                if err_params['log_Perr'][0] > 15.:
+                    mean_log_Perr = jnp.log((vol/err_params['log_Perr'][0])**3)
+                else:
+                    mean_log_Perr = err_params['log_Perr'][0]
+                std_log_Perr = err_params['log_Perr'][1]
+                log_Perr = numpyro.sample("log_Perr", dist.Normal(mean_log_Perr, std_log_Perr))
+                Perr = jnp.exp(log_Perr)
+            elif len(err_params['log_Perr']) == 1:
+                if err_params['log_Perr'][0] > 15.:
+                    Perr = (vol/err_params['log_Perr'][0])**3
+                else:
+                    Perr = jnp.exp(err_params['log_Perr'][0])
                 
         if which_space == 'k_space':
             sigma_err = jnp.sqrt(Perr / (2. * vol))
@@ -589,21 +738,16 @@ def field_inference(boxsize, redshift, which_pk,
             sigma2_err = Perr * ng3_max / vol
 
         if 'log_Peded' in err_params:
-            log_Peded = numpyro.sample("log_Peded", dist.Normal(*err_params['log_Peded']))
-            Peded = numpyro.deterministic("Peded", jnp.exp(log_Peded))
+            if len(err_params['log_Peded']) == 2:
+                log_Peded = numpyro.sample("log_Peded", dist.Normal(*err_params['log_Peded']))
+                Peded = numpyro.deterministic("Peded", jnp.exp(log_Peded))
+            elif len(err_params['log_Peded']) == 1:
+                Peded = jnp.exp(err_params['log_Peded'][0])
             bound = jnp.sqrt(Perr * Peded)
             if which_space == 'k_space':
-                sigma_eded = jnp.sqrt(Peded / (2. * vol))
+                sigma2_eded = jnp.sqrt(Peded / (2. * vol))
             elif which_space == 'r_space':
                 sigma2_eded = Peded * ng3_max / vol
-        elif 'fixed_log_Peded' in err_params:
-            fixed_log_Peded = err_params['fixed_log_Peded']
-            Peded = jnp.exp(fixed_log_Peded)
-            if which_space == 'k_space':
-                sigma_eded = jnp.sqrt(Peded / (2. * vol))
-            elif which_space == 'r_space':
-                sigma2_eded = Peded * ng3_max / vol
-        if 'Peed' in err_params:
             scaled_Peed = numpyro.sample("scaled_Peed", dist.Uniform(-1, 1.))
             Peed = numpyro.deterministic("Peed", scaled_Peed * bound)
             ratio = numpyro.deterministic("ratio", Peed / Peded)
@@ -612,64 +756,54 @@ def field_inference(boxsize, redshift, which_pk,
                 sigma_err = jnp.sqrt(Perr_eff / (2. * vol))
             elif which_space == 'r_space':
                 sigma2_eed = Peed * ng3_max / vol
-        elif 'fixed_Peed' in err_params:
-            Peed = jnp.exp(fixed_log_Peed)
-            if which_space == 'k_space':
-                Perr_eff = numpyro.deterministic("Perr_eff", Perr - Peed * Peed / Peded)
-                sigma_err = jnp.sqrt(Perr_eff / (2. * vol))
-            elif which_space == 'r_space':
-                sigma2_eed = Peed * ng3_max / vol
 
         if which_ics == 'varied_ics':
-            delk = A * f_model.linear_modes(cosmo_params_local, gauss_3d)
-            if do_pk:
-                g3 = gauss_3d / jnp.sqrt(2.*vol)
-                compute_pk('pk_ic_gauss', g3, None, measure_pk)
-                compute_pk('pk_ic_cosmo', delk, None, measure_pk)
-                if true_gauss_3d is not None:
-                    true_g3 = true_gauss_3d / jnp.sqrt(2.*vol)
-                    res_g3 = true_g3 - g3
-                    compute_pk('pk_ic_gauss_res', res_g3, None, measure_pk)
-                    compute_pk('pk_ic_gauss_cross', g3, true_g3, measure_pk)
-                    cosmo_params_true = jnp.array([OMEGA_B_TRUE, OMEGA_C_TRUE, HUBBLE_TRUE, NS_TRUE, ln1010As, redshift])
-                    true_delk = f_model.linear_modes(cosmo_params_true, true_gauss_3d)
-                    res_delk = delk - true_delk
-                    compute_pk('pk_ic_cosmo_res', res_delk, None, measure_pk)
-                    compute_pk('pk_ic_cosmo_cross', delk, true_delk, measure_pk)
+            delk = A * fwd_model.linear_modes(pk_lin_table, gauss_3d)
         else:
-            delk = A * f_model.linear_modes(cosmo_params_local, true_gauss_3d)
-        delk_L = coord.func_extend(ng_L, delk)
-                
+            delk = A * fwd_model.linear_modes(pk_lin_table, gauss_3d)
+        delk_L = PT_field.func_extend(ng_L, delk)
+
+        if isinstance(fwd_model, LPT_Forward):
+            fields_k_E = fwd_model.get_shifted_fields(delk_L, growth_f)
+        if isinstance(fwd_model, EPT_Forward):
+            fields_k_E = fwd_model.get_fields(delk_L)
+        field_k_E = fwd_model.get_final_field(fields_k_E, betas, beta_type='const')
+
         if which_space == 'k_space':
-            fieldk_model_E = f_model.compute_model(delk_L, biases)
-            if 'Sigma2_mu4' in model_name:
-                fieldk_model_E = fieldk_model_E * jnp.exp(-0.5 * Sigma2_mu4 * k2_E * mu2_E * mu2_E )
-            if 'Sigma2_mu2' in model_name:
-                fieldk_model_E = fieldk_model_E * jnp.exp(-0.5 * Sigma2_mu2 * k2_E * mu2_E)
-            if 'Sigma2' in model_name:
-                fieldk_model_E = fieldk_model_E * jnp.exp(-0.5 * Sigma2 * k2_E)
-            if kmax > 1.0:
-                fieldk_model = coord.func_reduce(ng_max, fieldk_model_E)
+            if 'Sigma2' in bias_params:
+                kx2E = fwd_model.kx2E[:, None, None]
+                ky2E = fwd_model.ky2E[None, :, None]
+                kz2E = fwd_model.kz2E[None, None, :]
+            if 'Sigma2_mu4' in bias_params:
+                k2E = kx2E + ky2E + kz2E
+                # Avoid division by zero at DC: set factor=1 where k2==0
+                factor = jnp.where(k2E > 0.0,
+                                   jnp.exp(-0.5 * Sigma2_mu4 * (kz2E * kz2E) / k2E),
+                                   1.0)
+                field_k_E = field_k_E * factor
+            if 'Sigma2_mu2' in bias_params:
+                field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2_mu2 * kz2E)
+            if 'Sigma2' in bias_params:
+                field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * kx2E)
+                field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * ky2E)
+                field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * kz2E)
+            if ng_max != field_k_E.shape[0]:
+                field_k_max = PT_field.func_reduce(ng_max, field_k_E)
             else:
-                if ng < ng_E:
-                    fieldk_model = coord.func_reduce(ng, fieldk_model_E)
-                elif ng == ng_E:
-                    fieldk_model = fieldk_model_E
-                elif ng > ng_E:
-                    fieldk_model = coord.func_extend(ng, fieldk_model_E)
-            field_model_1d_ind = independent_modes(fieldk_model)
+                field_k_max = field_k_E
+            field_1d_ind = indep_take(field_k_max)
         elif which_space == 'r_space':
-            fieldr_model, delr_max, d2r_max = f_model.compute_model(delk_L, biases)
-            field_model_1d_ind = fieldr_model.reshape(ng3_max)
-            if 'log_Peded' in err_params or 'fixed_log_Peded' in err_params:
-                d2r_1d_ind = d2r_max.reshape(ng3_max)
-            if 'Peed' in err_params or 'fixed_Peed' in err_params:
+            field_k_max = PT_field.func_reduce(ng_max, field_k_E)
+            field_r_max = jnp.fft.irfftn(field_k_max, norm='forward')
+            field_1d_ind = field_r_max.reshape(ng3_max)
+            if 'log_Peded' in err_params:
+                delk_max = PT_field.func_reduce(ng_max, delk_L)
+                delr_max = jnp.fft.irfftn(delk_max, norm='forward')
                 delr_1d_ind = delr_max.reshape(ng3_max)
-            if ('Peded' in err_params or 'fixed_Peded' in err_params or 
-                'Peed' in err_params or 'fixed_Peed' in err_params):
+                d2r_1d_ind = delr_1d_ind * delr_1d_ind
                 sigma2_err = sigma2_err + 2.0 * sigma2_eed * delr_1d_ind + sigma2_eded * d2r_1d_ind
             sigma_err = jnp.sqrt(sigma2_err)
-        data = numpyro.sample('data', dist.Normal(field_model_1d_ind, sigma_err), obs=obs_data)
+        data = numpyro.sample('data', dist.Normal(field_1d_ind, sigma_err), obs=obs_data)
 
     # -----------------------------
     # Setup before MCMC execution
@@ -705,8 +839,7 @@ def field_inference(boxsize, redshift, which_pk,
                     kernel=kernel,
                     obs_data=data_1d_ind,
                     mutable_state_vars=dict(
-                        f_model=f_model,
-                        k2_E = locals().get('k2_E', None),
+                        fwd_model=fwd_model,
                         ),
                     )
 
@@ -714,8 +847,7 @@ def field_inference(boxsize, redshift, which_pk,
     mcmc = MCMC(kernel, num_samples=1, num_warmup=1,
                 num_chains=n_chains, thinning=thin,
                 chain_method=chain_method, progress_bar=False)
-    # Create an RNG key from mcmc_seed (do not repeatedly use key 0)
-    rng_key = jax.random.PRNGKey(0)
+    rng_key = make_run_key(mcmc_seed, chain_id=0, batch_id=-1, resume_iter=i_contd)
     mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
     params = list(mcmc.get_samples().keys())
     params.append('potential_energy')
@@ -731,349 +863,236 @@ def field_inference(boxsize, redshift, which_pk,
                 num_chains=n_chains, thinning=thin,
                 chain_method=chain_method, progress_bar=False)
     
-    samples_prev = {}
-    map_samples = {}
-
-    mean_gauss_1d_prev = {}
+    map_samples = {}          # will hold per-chain MAP snapshots
 
     save_base = f'{save_path}'
+    state_path = lambda cid, it: f'{save_base}_state_chain{cid}_iter{it}.pkl'
     logger.info('save_base = %s', save_base)
 
     # Load previous samples if restarting (i_contd > 0)
     if i_contd > 0:
+        logger.info('Restart mode: loading states at iter=%d', i_contd)
+        if n_chains == 1:
+            st = load_hmc_state(state_path(i_chain, i_contd))
+            mcmc.post_warmup_state = st
+        else:
+            per = [load_hmc_state(state_path(i_chain + c, i_contd)) for c in range(n_chains)]
+            mcmc.post_warmup_state = merge_hmc_states(per)
+        tree_block_until_ready(mcmc.post_warmup_state)
+        logger.info("Loaded warmup state for restart.")
         for c in range(n_chains):
-            i_chain_ = i_chain + c
-            chain_key = f'chain_{i_chain_}'
-            
-            chain_file = f'{save_base}_samples_chain{i_chain_}.npz'
-            if os.path.exists(chain_file):
-                loaded = np.load(chain_file, allow_pickle=True)
-                samples_prev[chain_key] = loaded['samples'].item()
-                map_samples[chain_key] = loaded['MAP_samples'].item()
-                if which_ics == 'varied_ics':
-                    mean_gauss_1d_prev[chain_key] = loaded['mean_gauss_1d']
-                logger.info('Loaded previous samples from %s', chain_file)
-            else:
-                logger.error('Previous samples file %s not found.', chain_file)
-                sys.exit(1)
-            ### check the iteration count
-            sample_shape = samples_prev[chain_key][params[0]].shape  # shape = (total_samples_prev,)
-            i_contd_check = int(sample_shape[0] / i_sample)
-            logger.info(f'{params[0]} samples_previous.shape = {sample_shape}')
-            logger.info(f'i_contd = {i_contd}')
-            if i_contd != i_contd_check:
-                logger.error('i_contd != number of iterations in previous samples')
-                sys.exit(1)
-            else:
-                logger.info('i_contd matches previous iterations count.')
-        
-        rng_key = jax.random.PRNGKey(1)  # use seed, not 0
-        mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
-        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
-        logger.info("set-up finished and synchronized.")
-        
-        logger.info('Restarting sampling...')
-        #if n_chains == 1 and i_contd == 160:
-        #    #with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
-        #    with open(f'{save_base}_7_210_last_state.pkl', 'rb') as f:
-        #        last_state = pickle.load(f)
-        #    mcmc.post_warmup_state = last_state
-        if n_chains == 1:
-            #if i_contd == 350:
-            #    with open(f'{save_base}_{i_chain}_{i_contd}_last_state.pkl', 'rb') as f:
-            #        last_state = pickle.load(f)
-            if 'rsd' in model_name:
-                with open(f'{save_base}_3_400_last_state.pkl', 'rb') as f:
-                    last_state = pickle.load(f)
-            else:
-                with open(f'{save_base}_3_410_last_state.pkl', 'rb') as f:
-                    last_state = pickle.load(f)
-            mcmc.post_warmup_state = last_state
-        else:
-            per_chain_states = []
-            for c in range(n_chains):
-                i_chain_ = i_chain + c
-                with open(f'{save_base}_{i_chain_}_{i_contd}_last_state.pkl', 'rb') as f:
-                    per_chain_states.append(pickle.load(f))
-            mcmc.post_warmup_state = merge_hmc_states(per_chain_states)
-        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
-        logger.info("Merged HMCState synchronized.")
-        logger.info('LOADED warmup state:')
-        logger.info(mcmc.post_warmup_state)
-
+            cid = i_chain + c
+            chain_key = f'chain_{cid}'
+            map_samples[chain_key] = {'potential_energy': jnp.inf}  # sentinel
+            old_file = f'{save_base}_samples_chain{cid}.npz'
+            if os.path.exists(old_file):
+                _, old_map, _ = load_samples_npz(old_file)
+                if 'potential_energy' in old_map:
+                    map_samples[chain_key].update(old_map)
     elif n_warmup <= 1:
-        rng_key = jax.random.PRNGKey(2)
-        mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',))
-        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
-        logger.info("set-up finished and synchronized.")
-        if n_chains == 1:
-            #with open(f'{save_base}_{i_chain}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
-            #with open(f'{save_base}_{i_chain}_80_last_state.pkl', 'rb') as f:
-            with open(f'{save_base}_4_10_last_state.pkl', 'rb') as f:
-                last_state = pickle.load(f)
-            mcmc.post_warmup_state = last_state
+        template_file = kwargs.get("template_state_file", None)
+        template_chain = int(kwargs.get("template_chain", i_chain))  # chain_id
+        template_iter  = int(kwargs.get("template_iter", 0))         # 0=post-warmup
+        template_state = None
+        if template_file is not None and os.path.exists(template_file):
+            logger.info("Loading template state from file: %s", template_file)
+            st = load_hmc_state(template_file)
+            template_state = split_hmc_state_by_chain(st, getattr(st, "rng_key", jnp.zeros((1,))).shape[0] if hasattr(st, "rng_key") else 1)[0]
         else:
-            per_chain_states = []
-            for c in range(n_chains):
-                i_chain_ = i_chain + c
-                mcmc_seed_ = mcmc_seed + 12345 * i_chain_
-                with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'rb') as f:
-                    per_chain_states.append(pickle.load(f))
-            mcmc.post_warmup_state = merge_hmc_states(per_chain_states)
-        tree_block_until_ready(mcmc.post_warmup_state) # <-- sync here
-        logger.info('LOADED warmup state:')
-        logger.info(mcmc.post_warmup_state)
+            cand = state_path(template_chain, template_iter)
+            if os.path.exists(cand):
+                logger.info("Loading template state: %s", cand)
+                template_state = load_hmc_state(cand)
+            else:
+                raise RuntimeError("Template state not found.")
+        mcmc.post_warmup_state = broadcast_state_to_chains(
+            template_state,
+            n_chains,
+            base_seed=mcmc_seed,
+            resume_iter=i_contd,
+            chain_id_start=i_chain,
+        )
+        tree_block_until_ready(mcmc.post_warmup_state)
+        logger.info("Broadcasted template state to %d chains (rng_keys are independent).", n_chains)
     else:
         mcmc_seed += 12345 * i_chain
         rng_key = jax.random.PRNGKey(mcmc_seed)
         logger.info(f'rng_seed = {mcmc_seed}')
         mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
         tree_block_until_ready(mcmc.post_warmup_state)
-        logger.info('post_warmup_state:')
-        logger.info(mcmc.post_warmup_state)
-        inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
-        if n_chains == 1:
-            inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None, :, :]
-        i_warmup = 1
-        criteria = 0.9
-        logger.info(f'i_warmup = {i_warmup}')
-        logger.info(f'inv_mass_matrix[{dense_mass[0]}].shape = {inv_mass_matrix[dense_mass[0]].shape}')
-        logger.info(f'inv_mass_matrix = {inv_mass_matrix}')
-        index_map, check_fail = check_dense_mass_matrix(inv_mass_matrix, dense_mass[0], criteria)
-        logger.info(f'Initial dense mass matrix check: check_fail={check_fail}')
-        chain_warmup_states = split_hmc_state_by_chain(mcmc.post_warmup_state, n_chains)
-        for c, st in enumerate(chain_warmup_states):
-            i_chain_ = i_chain + c
-            mcmc_seed_ = mcmc_seed + 12345 * i_chain_
-            with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'wb') as f:
-                pickle.dump(st, f)
+
+        def _check(inv_mass_matrix):
+            if n_chains == 1:
+                inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None, :, :]
+            return check_dense_mass_matrix(inv_mass_matrix, dense_mass[0], criteria=0.9)[1]  # -> check_fail
+        
+        inv_mm = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
+        check_fail = _check(inv_mm)
         warmup_iter = 0
-        # Use proper key splitting inside the warmup loop
         while check_fail:
             warmup_iter += 1
             if warmup_iter > MAX_WARMUP_ITERS:
-                logger.error('Reached maximum warmup iterations without passing dense mass matrix check.')
-                sys.exit(1)
-            rng_key, subkey = jax.random.split(rng_key)
-            logger.info(f'Warmup iteration: {warmup_iter}')
-            mcmc.warmup(subkey, obs_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
+                raise RuntimeError("Reached maximum warmup iterations without passing dense mass matrix check.")
+            rng_key = make_run_key(mcmc_seed, chain_id=0, batch_id=warmup_iter, resume_iter=0)
+            mcmc.warmup(rng_key, obs_data=data_1d_ind, extra_fields=('potential_energy',), collect_warmup=False)
             tree_block_until_ready(mcmc.post_warmup_state)
-            inv_mass_matrix = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
-            if n_chains == 1:
-                inv_mass_matrix[dense_mass[0]] = inv_mass_matrix[dense_mass[0]][None, :, :]
-            i_warmup += 1
-            index_map, check_fail = check_dense_mass_matrix(inv_mass_matrix, dense_mass[0], criteria)
-            logger.info(f'After warmup iteration {i_warmup}: check_fail={check_fail}')
-            #post_warmup_state = tree_map(jnp.array, mcmc.post_warmup_state)
-            chain_warmup_states = split_hmc_state_by_chain(mcmc.post_warmup_state, n_chains)
-            for c, st in enumerate(chain_warmup_states):
-                i_chain_ = i_chain + c
-                mcmc_seed_ = mcmc_seed + 12345 * i_chain_
-                with open(f'{save_base}_{i_chain_}_{mcmc_seed_}_warmup_state.pkl', 'wb') as f:
-                    pickle.dump(st, f)
-            #for c in range(n_chains):
-            #    i_chain_ = i_chain + c
-            #    mcmc_seed_ = mcmc_seed + 12345 * i_chain_
-            #    with open(f'{save_base}_{i_chain_}_{mcmc_seed}_warmup_state.pkl', 'wb') as f:
-            #        pickle.dump(chain_warmup_states[c], f)
-        logger.info(f'Final dense mass matrix check passed after {i_warmup} warmup iterations.')
+            inv_mm = copy.deepcopy(mcmc.post_warmup_state.adapt_state.inverse_mass_matrix)
+            check_fail = _check(inv_mm)
+            logger.info('Warmup iteration %d, dense mass check_fail=%s', warmup_iter, check_fail)
+        for c, st in enumerate(split_hmc_state_by_chain(mcmc.post_warmup_state, n_chains)):
+            save_hmc_state(st, state_path(i_chain + c, 0))
+        logger.info("Warmup finished and state saved.")
 
     # -----------------------------
     # MCMC loop: run for i_iter batches
     # -----------------------------
     mean_gauss_1d = [None] * n_chains
-    posterior_samples = {param: None for param in params}
+    mean_count = [0] * n_chains  # running mean count (per chain)
 
-    #samples = mcmc.get_samples(group_by_chain=True)
-    #print(samples, file=sys.stderr)
-    #samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
-    #for param in params:
-    #    arr = samples[param].astype(np.float32)  # shape (chains, batch_size)
-    #    if posterior_samples[param] is None:
-    #        posterior_samples[param] = arr
-    #    else:
-    #        posterior_samples[param] = jnp.concatenate([posterior_samples[param], 
-    #                                                    arr], 
-    #                                                    axis=1)
+    # Per-chain IDs and in-memory accumulators
+    chain_ids = [i_chain + c for c in range(n_chains)]
+    combined = {cid: {p: None for p in params} for cid in chain_ids}
+    combined_pk = {cid: dict(auto=None, cross=None, resid=None) for cid in chain_ids} if (do_pk and which_ics == 'varied_ics') else None
 
+    # Load previous samples if restarting (i_contd > 0)
+    for c, cid in enumerate(chain_ids):
+        old_file = f'{save_base}_samples_chain{cid}.npz'
+        if i_contd > 0 and os.path.exists(old_file):
+            old_samples, _, old_mean = load_samples_npz(old_file)
+            for p in params:
+                if p in old_samples:
+                    combined[cid][p] = np.asarray(old_samples[p])
+            if which_ics == 'varied_ics' and old_mean is not None:
+                mean_gauss_1d[c] = np.asarray(old_mean)
+                # Adjust mean_count to reflect total samples in old file
+                mean_count[c] = i_contd * int(i_sample / thin)
+
+        if do_pk and which_ics == 'varied_ics':
+            old_pk = f'{save_base}_pk_ic_chain{cid}.npz'
+            if i_contd > 0 and os.path.exists(old_pk):
+                z = np.load(old_pk)
+                combined_pk[cid]['auto']  = np.asarray(z['pk_auto'])  if 'pk_auto'  in z.files else None
+                combined_pk[cid]['cross'] = np.asarray(z['pk_cross']) if 'pk_cross' in z.files else None
+                combined_pk[cid]['resid'] = np.asarray(z['pk_resid']) if 'pk_resid' in z.files else None
+                z.close()
+
+    # Ensure save directory exists
+    Path(save_base).parent.mkdir(parents=True, exist_ok=True)
 
     for i in range(i_iter):
         logger.info("running batch %d ...", i)
-        rng_key = jax.random.PRNGKey(mcmc_seed+10*i_chain+1234*i+12345*i_contd)
-        rng_key, run_key = jax.random.split(rng_key)
+        run_key = make_run_key(mcmc_seed, chain_id=0, batch_id=i, resume_iter=i_contd)
         mcmc.run(run_key,
-        #mcmc.run(mcmc.post_warmup_state.rng_key,
                  obs_data=data_1d_ind,
-                 #collect_warmup = True,
                  extra_fields=('potential_energy',))
         tree_block_until_ready(mcmc.last_state)
-        samples = mcmc.get_samples(group_by_chain=True)
-        samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
-        
-        # Accumulate posterior samples
-        for param in params:
-            arr = samples[param].astype(np.float32)  # shape (chains, batch_size)
-            if posterior_samples[param] is None:
-                posterior_samples[param] = arr
-            else:
-                posterior_samples[param] = jnp.concatenate([posterior_samples[param], 
-                                                            arr], 
-                                                            axis=1)
-        
-        # Update chain-wise summaries (mean IC and MAP)
+
+        dev_samples = mcmc.get_samples(group_by_chain=True)
+        dev_samples['potential_energy'] = mcmc.get_extra_fields(group_by_chain=True)['potential_energy']
+
+        # ---- accumulate samples in memory ----
+        for c in range(n_chains):
+            cid = i_chain + c
+            for p in params:
+                arr = np.asarray(dev_samples[p][c]).astype(np.float32)  # (batch, ...)
+                if combined[cid][p] is None:
+                    combined[cid][p] = arr
+                else:
+                    combined[cid][p] = np.concatenate([combined[cid][p], arr], axis=0)
+
+        # ---- accumulate IC power spectra if needed ----
+        if (do_pk and which_ics == 'varied_ics') and ('gauss_1d' in dev_samples):
+            for c in range(n_chains):
+                cid = i_chain + c
+                g_batch = dev_samples['gauss_1d'][c]  # (batch, ng3), on device
+                if xres_pk_fn is not None:
+                    A, C, R = xres_pk_fn(g_batch)   # device -> host
+                    A = np.asarray(A); C = np.asarray(C); R = np.asarray(R)
+                    if combined_pk[cid]['auto'] is None:  combined_pk[cid]['auto']  = A
+                    else:                                  combined_pk[cid]['auto']  = np.concatenate([combined_pk[cid]['auto'],  A], axis=0)
+                    if combined_pk[cid]['cross'] is None: combined_pk[cid]['cross'] = C
+                    else:                                  combined_pk[cid]['cross'] = np.concatenate([combined_pk[cid]['cross'], C], axis=0)
+                    if combined_pk[cid]['resid'] is None: combined_pk[cid]['resid'] = R
+                    else:                                  combined_pk[cid]['resid'] = np.concatenate([combined_pk[cid]['resid'], R], axis=0)
+                else:
+                    A = np.asarray(auto_pk_fn(g_batch))
+                    if combined_pk[cid]['auto'] is None:
+                        combined_pk[cid]['auto'] = A
+                    else:
+                        combined_pk[cid]['auto'] = np.concatenate([combined_pk[cid]['auto'], A], axis=0)
+
+        # ---- update MAP samples if needed ----
         for c in range(n_chains):
             chain_key = f'chain_{i_chain + c}'
-            # update mean of IC
+
             if which_ics == 'varied_ics':
-                ic_samples = samples['gauss_1d'][c]
-                batch_mean = np.mean(ic_samples, axis=0)
-                mean_gauss_1d[c] = batch_mean if i == 0 else (i * mean_gauss_1d[c] + batch_mean) / (i + 1)
-            # update MAP samples
-            pe = samples['potential_energy'][c]
-            idx_min = int(jnp.argmin(pe))
-            if i_contd == 0 or pe[idx_min] <= map_samples[chain_key]['potential_energy']:
-                map_samples[chain_key] = {p: samples[p][c, idx_min] for p in map_params}
-                logger.info(f"Updated MAP samples for {chain_key}: {map_samples[chain_key]}")
-
-        last_state = mcmc.last_state
-        mcmc.post_warmup_state = last_state
-
-        # Save last state at final batch
-        if i == i_iter - 1:
-            i_last = i + i_contd + 1
-            chain_states = split_hmc_state_by_chain(last_state, n_chains)
-            for c, st in enumerate(chain_states):
-                with open(f'{save_base}_{i_chain+c}_{i_last}_last_state.pkl', 'wb') as f:
-                    pickle.dump(st, f)
-        
-        '''
-        if i == 0:
-            for param in params:
-                posterior_samples[param] = jax.device_put(samples[param].astype(np.float32), cpus[0])
-            if which_ics == 'varied_ics' and do_pk: ### compute pk_ic
-                gauss_1d_stack = jnp.stack([jnp.array(samples['gauss_1d'][c]) for c in range(n_chains)], 
-                                           axis=0)
-                pk_ic = batch_pk_ic_pmap(gauss_1d_stack,
-                                         ng,
-                                         boxsize**3,
-                                         measure_pk)
-                if true_gauss_3d is not None:
-                    pk_ic_res_cross = batch_pk_ic_res_cross_pmap(jnp.array(samples['gauss_1d']),
-                                                                 jnp.array(true_gauss_3d),
-                                                                 ng,
-                                                                 boxsize**3,
-                                                                 measure_pk)
-            for c in range(n_chains):
-                i_chain_ = i_chain + c
-                if which_ics == 'varied_ics':
-                    mean_gauss_1d[c] = np.mean(samples['gauss_1d'][c], axis=0)
-                curr_min_idx = np.argmin(samples['potential_energy'][c])
-                curr_min_value = samples['potential_energy'][c][curr_min_idx]
-                if i_contd == 0:
-                    map_samples[f'chain_{i_chain_}'] = {}
-                    for param in map_params:
-                        map_samples[f'chain_{i_chain_}'][param] = samples[param][c][curr_min_idx]
+                ic_samples = dev_samples['gauss_1d'][c]  # (batch, ng3)
+                batch_mean = np.asarray(jnp.mean(ic_samples, axis=0))
+                bsz = int(ic_samples.shape[0])
+                if mean_gauss_1d[c] is None:
+                    mean_gauss_1d[c] = batch_mean
+                    mean_count[c] = bsz
                 else:
-                    if curr_min_value <= map_samples[f'chain_{i_chain_}']['potential_energy']:
-                        for param in map_params:
-                            map_samples[f'chain_{i_chain_}'][param] = samples[param][c][curr_min_idx]
-                logger.info(f'MAP samples (initial batch) in chain {i_chain_}:')
-                for param in map_params:
-                    logger.info(f'{param}: {map_samples[f'chain_{i_chain_}'][param]}')
-        else:
-            for param in params:
-                posterior_samples[param] = np.concatenate(
-                    [posterior_samples[param], samples[param].astype(np.float32)], axis=1)
-            if which_ics == 'varied_ics' and do_pk: ### compute pk_ic
-                gauss_1d_stack = jnp.stack([jnp.array(samples['gauss_1d'][c]) for c in range(n_chains)], 
-                                           axis=0)
-                pk_ic_batch = batch_pk_ic_pmap(gauss_1d_stack,
-                                               ng,
-                                               boxsize**3,
-                                               measure_pk)
-                pk_ic = jnp.concatenate([pk_ic, pk_ic_batch], axis=1)
-                if true_gauss_3d is not None:
-                    pk_ic_res_cross_batch = batch_pk_ic_res_cross_pmap(jnp.array(samples['gauss_1d']),
-                                                                       jnp.array(true_gauss_3d),
-                                                                       ng,
-                                                                       boxsize**3,
-                                                                       measure_pk)
-                    pk_ic_res_cross = jnp.concatenate([pk_ic_res_cross, pk_ic_res_cross_batch], axis=1)
-            for c in range(n_chains):
-                i_chain_ = i_chain + c
-                if which_ics == 'varied_ics':
-                    batch_mean = np.mean(samples['gauss_1d'][c], axis=0)
-                    mean_gauss_1d[c] = (i * mean_gauss_1d[c] + batch_mean) / (i + 1)
-                curr_min_idx = np.argmin(samples['potential_energy'][c])
-                curr_min_value = samples['potential_energy'][c][curr_min_idx]
-                if curr_min_value <= map_samples[f'chain_{i_chain_}']['potential_energy']:
-                    for param in map_params:
-                        map_samples[f'chain_{i_chain_}'][param] = samples[param][c][curr_min_idx]
-                    logger.info(f'MAP samples in chain {i_chain_} updated:')
-                    for param in map_params:
-                        logger.info(f'{param}: {map_samples[f'chain_{i_chain_}'][param]}')
-                    
-        last_state = mcmc.last_state
-        mcmc.post_warmup_state = last_state
-        del samples
+                    mean_gauss_1d[c] = (mean_gauss_1d[c] * mean_count[c] + batch_mean * bsz) / (mean_count[c] + bsz)
+                    mean_count[c] += bsz
+
+            pe = dev_samples['potential_energy'][c]
+            idx_min = int(jnp.argmin(pe))
+            if (i_contd == 0) or (pe[idx_min] <= map_samples[chain_key]['potential_energy']):
+                map_samples[chain_key] = {p: np.asarray(dev_samples[p][c, idx_min]).astype(np.float32) for p in map_params}
+                logger.info("Updated MAP samples for %s", chain_key)
+
+        # ---- save samples to file (npz, atomic replace) ----
+        for c, cid in enumerate(chain_ids):
+            arrays_to_save = {}
+            for p in params:
+                if combined[cid][p] is None:
+                    arrays_to_save[p] = np.empty((0,), dtype=np.float32)
+                else:
+                    arrays_to_save[p] = combined[cid][p]
+
+            tmp_samples = f'{save_base}_samples_chain{cid}.npz.tmp'
+            final_samples = f'{save_base}_samples_chain{cid}.npz'
+            save_samples_npz(tmp_samples, arrays_to_save, map_samples[f'chain_{cid}'], mean_gauss_1d[c] if which_ics == 'varied_ics' else None)
+            os.replace(tmp_samples, final_samples)
+            logger.info('Saved %s', final_samples)
+
+            # ---- save IC power spectra if needed (npz, atomic replace) ----
+            if do_pk and which_ics == 'varied_ics' and combined_pk is not None:
+                out_pk = {}
+                if combined_pk[cid]['auto']  is not None: out_pk['pk_auto']  = combined_pk[cid]['auto'].astype(np.float32)
+                if combined_pk[cid]['cross'] is not None: out_pk['pk_cross'] = combined_pk[cid]['cross'].astype(np.float32)
+                if combined_pk[cid]['resid'] is not None: out_pk['pk_resid'] = combined_pk[cid]['resid'].astype(np.float32)
+                if len(out_pk) > 0:
+                    tmp_pk = f'{save_base}_pk_ic_chain{cid}.npz.tmp'
+                    final_pk = f'{save_base}_pk_ic_chain{cid}.npz'
+                    np.savez_compressed(tmp_pk, **out_pk)
+                    os.replace(tmp_pk, final_pk)
+                    logger.info('Saved %s', final_pk)
+
+        # ---- save states to file (pkl, atomic replace) ----
+        mcmc.post_warmup_state = mcmc.last_state
+        chk_iter = i_contd + i + 1
+        chain_states = split_hmc_state_by_chain(mcmc.last_state, n_chains)
+        for c, st in enumerate(chain_states):
+            tmp  = f"{save_base}_state_chain{i_chain + c}_iter{chk_iter}.pkl.tmp"
+            final = state_path(i_chain + c, chk_iter)
+            save_hmc_state(st, tmp)
+            os.replace(tmp, final)  # atomic
+            prev = state_path(i_chain + c, chk_iter - 1)
+            if os.path.exists(prev):
+                try:
+                    os.remove(prev)
+                except Exception:
+                    pass
+
         if i == i_iter - 1:
-            logger.info("Batch %d completed; saving last state.", i)
-            i_last = i + i_contd + 1
-            chain_last_states = split_hmc_state_by_chain(last_state, n_chains)
-            for c in range(n_chains):
-                i_chain_ = i_chain + c
-                with open(f'{save_base}_{i_chain_}_{i_last}_last_state.pkl', 'wb') as f:
-                    pickle.dump(chain_last_states[c], f)
+            logger.info("Saved last states for restart at iter=%d", chk_iter)
 
-        '''
-
+    # ---- Final MAP logging ----
     for c in range(n_chains):
-        i_chain_ = i_chain + c
-        logger.info(f'MAP samples (final) in chain {i_chain_}:')
+        cid = i_chain + c
+        chain_key = f'chain_{cid}'
+        logger.info('MAP samples (final) in chain %d:', cid)
         for param in map_params:
-            logger.info(f'{param}: {map_samples[f'chain_{i_chain_}'][param]}')
-
-    # Combine current posterior_samples with previous samples (if any)
-    for c in range(n_chains):
-        i_chain_ = i_chain + c
-        chain_key = f'chain_{i_chain_}'
-        combined_samples = {}
-        for param in posterior_samples.keys():
-            current = posterior_samples[param][c]  # current samples for chain c
-            if chain_key in samples_prev and param in samples_prev[chain_key]:
-                combined = np.concatenate([samples_prev[chain_key][param], current], axis=0)
-                combined_samples[param] = combined
-                logger.info(f'Chain {i_chain_}, parameter {param}: concatenated samples shape = {combined.shape}')
-            else:
-                combined_samples[param] = current
-                logger.info(f'Chain {i_chain_}, parameter {param}: new samples shape = {current.shape}')
-        # Save gauss_1d mean (restart-capable)
-        if which_ics == 'varied_ics':
-            if i_contd > 0:
-                factor = i_contd * int(i_sample / thin)
-                new_mean = (n_samples * mean_gauss_1d[c] + factor * mean_gauss_1d_prev[chain_key]) / (n_samples + factor)
-                logger.info(f'Chain {i_chain_}: Updated gauss_1d mean: new shape = {new_mean.shape}')
-            else:
-                new_mean = mean_gauss_1d[c]
-            save_file = f'{save_base}_samples_chain{i_chain_}.npz'
-            save_kwargs = {
-                'samples': combined_samples,
-                'MAP_samples': map_samples[chain_key],
-                'mean_gauss_1d': new_mean,
-                }
-            np.savez_compressed(save_file, **save_kwargs)
-            logger.info(f'Saved combined samples for chain {i_chain_} to {save_file}')
-        else:
-            save_file = f'{save_base}_samples_chain{i_chain_}.npz'
-            np.savez_compressed(save_file, 
-                                samples=combined_samples,
-                                MAP_samples=map_samples[chain_key])
-            logger.info(f'Saved combined samples for chain {i_chain_} to {save_file}')
-
-    if i_contd > 0:
-        for c in range(n_chains):
-            i_chain_ = i_chain + c
-            state_file = f'{save_base}_{i_chain_}_{i_contd}_last_state.pkl'
-            if os.path.exists(state_file):
-                os.remove(state_file)
-                logger.info(f'Removed temporary file {state_file}')
+            logger.info('%s: %s', param, map_samples[chain_key][param])

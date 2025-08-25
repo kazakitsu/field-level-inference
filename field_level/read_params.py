@@ -118,10 +118,6 @@ def read_params(params_file):
             # For err parameters. For log_Perr and log_Peded, use tuple if two numbers provided.
             elif key in ['log_Perr', 'log_Peded', 'Perr_k2', 'log_Perr_k2mu2',]:
                 err_params[key] = parse_numeric_value(value)
-            # For other err parameters, read single value.
-            elif key in ['fixed_log_Perr', 'fixed_log_Peed', 
-                         'fixed_Peded', 'Peed', 'fixed_Peed']:
-                err_params[key] = float(value)
             elif key == 'kmax':
                 kmax = float(value)
             # MCMC parameters:
