@@ -12,8 +12,6 @@ collect_ics 0
 ng 128
 ng_L 192
 ng_E 128
-#ng_cut 128
-#ng_e 128
 
 ### forword model
 model_name gauss
@@ -26,14 +24,13 @@ interlace 1
 which_space k_space
 #which_space r_space
 
-### cosmo params ('truth')
-#A 1.0
-sigma8 0.8350423924781689
-oc 0.11933
-hubble 0.73
+### cosmo params: U(min, max)
+A 0.5 1.5
+oc 0.05 0.255
+hubble 0.73 ### fixed
 
 ### bias params
-#b1 2.0
+#b1 1.0
 #b2 -0.5
 #bG2 -0.5
 #bGamma3 0.0
@@ -43,22 +40,17 @@ hubble 0.73
 #Sigma2_mu2 0.0
 
 ### err params
-log_Perr 8.0
-#fixed_log_Perr 8.0
+log_Perr 8.0 ### fixed
 
-#dense_mass A oc hubble b1 b2 bG2 cs2 log_Perr
-#dense_mass A oc hubble log_Perr
-#dense_mass A oc hubble
-#dense_mass sigma8 oc hubble
-dense_mass sigma8 oc hubble log_Perr
+dense_mass A oc
 
-kmax 0.1
+kmax 0.12
 
 ### mcmc params
 i_chain 0
 thin 1
 n_samples 10000
-n_warmup 1000
+n_warmup 500
 accept_rate 0.8
 mcmc_seed 10
 i_contd 0

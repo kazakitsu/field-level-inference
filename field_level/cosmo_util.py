@@ -2,15 +2,8 @@
 from functools import partial
 from jax import jit
 import jax.numpy as jnp
-import field_level.util as util
+import jax.scipy as jsp
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
-
-@jit
-def growth_D(z, OM0):
-    w = -1
-    a = 1./(1+z)
-    qa = ((1-OM0)/OM0)*a**(-3*w)
-    return a*util.hyp2f1(-1./(3*w), (w-1)/(2*w), 1-5/(6*w), -qa)/(util.hyp2f1(-1./(3*w), (w-1)/(2*w), 1-5/(6*w), -(1-OM0)/OM0)) #normalized by D(z=0)
 
 @jit
 def growth_f_fitting(z, OM0):
@@ -38,7 +31,7 @@ class Pk_Provider:
         return jnp.stack([k, P], axis=0).T  # shape (N, 2)
 
     @partial(jit, static_argnames=('self',))
-    def pow_Pk(k, norm=2e4, n_pow=-2.5):
+    def pow_Pk(self, k, norm=2e4, n_pow=-2.5):
         return norm*(k/0.1)**n_pow
 
     @partial(jit, static_argnames=('self', 'R', 'integral_type'))
@@ -46,6 +39,6 @@ class Pk_Provider:
         if integral_type == 'trap':
             x = pk_lin[:,0] * R
             wk = 3.*(jnp.sin(x)/x/x - jnp.cos(x)/x)/x
-            sigma8 = jnp.sqrt(util.trapezoid(pk_lin[:,0]**3*pk_lin[:,1]*wk**2/(2.*jnp.pi**2),
-                                             jnp.log(pk_lin[:,0])) )
+            sigma8 = jnp.sqrt(jsp.integrate.trapezoid(pk_lin[:,0]**3*pk_lin[:,1]*wk**2/(2.*jnp.pi**2),
+                                                      jnp.log(pk_lin[:,0])) )
         return sigma8

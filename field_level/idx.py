@@ -1,174 +1,158 @@
 # !/usr/bin/env python3
-
 import jax.numpy as jnp
 from jax import jit
-import numpy as np
 from functools import partial
+import numpy as np
 
-from PT_field import coord
+import PT_field.coord_jax as coord
 
-def idx_func(ng,a,b,c):
+# --- kept for gauss_1d_to_3d plan (used elsewhere) ---
+def idx_func(ng, a, b, c):
     ngo2 = ng // 2
     if c > ngo2:
         c = ng - c
-    return int((a*ng+b)*(ngo2+1)+c)
+    return int((a * ng + b) * (ngo2 + 1) + c)
 
 def indep_coord(ng):
-    ng2 = ng*ng
-    ng3 = ng*ng*ng
+    """
+    Return index plan for mapping 1D Gaussian DOF to Hermitian-symmetric rfftn layout.
+    This is needed by build_gauss_1d_to_3d and kept unchanged.
+    """
+    ng2 = ng * ng
+    ng3 = ng * ng * ng
     ngo2 = ng // 2
     ng2o2 = ng2 // 2
     ng3o2 = ng3 // 2
-    # num = ng * ng * (ng//2 + 1)  # actual size
-    
-    ### c = 0 plane
-    coord_czero_real = np.array([0, 
-                                 idx_func(ng,ngo2,0,0), 
-                                 idx_func(ng,0,ngo2,0), 
-                                 idx_func(ng,ngo2,ngo2,0)
-                                 ], dtype=np.uint32)
-    
-    coord_czero_azero_bhalf = np.arange(idx_func(ng,0,1,0), 
-                                        idx_func(ng,0,ngo2-1,0)+1, 
-                                        ngo2+1, 
-                                        dtype=np.uint32)
-    
-    coord_czero_azero_bhalf_conj = ng2o2 + ng - coord_czero_azero_bhalf
 
-    coord_czero_ahalf_bzero = np.arange(idx_func(ng,1,0,0), 
-                                        idx_func(ng,ngo2-1,0,0)+1, 
-                                        ng2o2+ng, 
-                                        dtype=np.uint32)
-    
-    coord_czero_ahalf_bzero_conj = ng3o2 + ng2 - coord_czero_ahalf_bzero
+    coord_czero_real = np.array([0,
+                                 idx_func(ng, ngo2, 0, 0),
+                                 idx_func(ng, 0, ngo2, 0),
+                                 idx_func(ng, ngo2, ngo2, 0)], dtype=np.uint32)
 
-    coord_czero_ahalf_bngo2 = coord_czero_ahalf_bzero + (ng2o2 // 2) + ngo2
-    coord_czero_ahalf_bngo2_conj = coord_czero_ahalf_bzero_conj + (ng2o2 // 2) + ngo2
-    
+    coord_czero_azero_bhalf = np.arange(idx_func(ng, 0, 1, 0),
+                                        idx_func(ng, 0, ngo2 - 1, 0) + 1,
+                                        ngo2 + 1, dtype=np.uint32)
+    coord_czero_azero_bhalf_conj = ng2 // 2 + ng - coord_czero_azero_bhalf
+
+    coord_czero_ahalf_bzero = np.arange(idx_func(ng, 1, 0, 0),
+                                        idx_func(ng, ngo2 - 1, 0, 0) + 1,
+                                        ng2 // 2 + ng, dtype=np.uint32)
+    coord_czero_ahalf_bzero_conj = ng3 // 2 + ng2 - coord_czero_ahalf_bzero
+
+    coord_czero_ahalf_bngo2 = coord_czero_ahalf_bzero + (ng2 // 4) + ngo2
+    coord_czero_ahalf_bngo2_conj = coord_czero_ahalf_bzero_conj + (ng2 // 4) + ngo2
+
     coord_czero_aall_bhalf = np.array([
-        np.arange(
-            idx_func(ng,1,i+1,0), 
-            idx_func(ng,ng-1,i+1,0)+1, 
-            ng2o2+ng
-            ) for i in range(ngo2-1)
-            ], dtype=np.uint32)
-    coord_czero_aall_bhalf_conj = ng3o2 + 3*ng2o2 + ng - coord_czero_aall_bhalf
+        np.arange(idx_func(ng, 1, i + 1, 0),
+                  idx_func(ng, ng - 1, i + 1, 0) + 1,
+                  ng2 // 2 + ng) for i in range(ngo2 - 1)
+    ], dtype=np.uint32)
+    coord_czero_aall_bhalf_conj = ng3 // 2 + 3 * (ng2 // 2) + ng - coord_czero_aall_bhalf
 
-    ### c = ng/2 plane
     coord_cngo2_real = coord_czero_real + ngo2
-    
     coord_cngo2_azero_bhalf = ngo2 + coord_czero_azero_bhalf
     coord_cngo2_azero_bhalf_conj = ngo2 + coord_czero_azero_bhalf_conj
-
     coord_cngo2_ahalf_bzero = ngo2 + coord_czero_ahalf_bzero
     coord_cngo2_ahalf_bzero_conj = ngo2 + coord_czero_ahalf_bzero_conj
-
     coord_cngo2_ahalf_bngo2 = ngo2 + coord_czero_ahalf_bngo2
     coord_cngo2_ahalf_bngo2_conj = ngo2 + coord_czero_ahalf_bngo2_conj
-
     coord_cngo2_aall_bhalf = ngo2 + coord_czero_aall_bhalf
     coord_cngo2_aall_bhalf_conj = ngo2 + coord_czero_aall_bhalf_conj
-        
-    return (coord_czero_real, 
-            coord_czero_azero_bhalf, 
+
+    return (coord_czero_real,
+            coord_czero_azero_bhalf,
             coord_czero_azero_bhalf_conj,
-            coord_czero_ahalf_bzero, 
+            coord_czero_ahalf_bzero,
             coord_czero_ahalf_bzero_conj,
-            coord_czero_ahalf_bngo2, 
+            coord_czero_ahalf_bngo2,
             coord_czero_ahalf_bngo2_conj,
-            coord_czero_aall_bhalf, 
+            coord_czero_aall_bhalf,
             coord_czero_aall_bhalf_conj,
-            coord_cngo2_real, 
-            coord_cngo2_azero_bhalf, 
+            coord_cngo2_real,
+            coord_cngo2_azero_bhalf,
             coord_cngo2_azero_bhalf_conj,
-            coord_cngo2_ahalf_bzero, 
+            coord_cngo2_ahalf_bzero,
             coord_cngo2_ahalf_bzero_conj,
-            coord_cngo2_ahalf_bngo2, 
+            coord_cngo2_ahalf_bngo2,
             coord_cngo2_ahalf_bngo2_conj,
-            coord_cngo2_aall_bhalf, 
-            coord_cngo2_aall_bhalf_conj,)
+            coord_cngo2_aall_bhalf,
+            coord_cngo2_aall_bhalf_conj)
 
-def indep_coord_stack(ng):
-    (coord_czero_real, coord_czero_azero_bhalf, coord_czero_azero_bhalf_conj,
-     coord_czero_ahalf_bzero, coord_czero_ahalf_bzero_conj,
-     coord_czero_ahalf_bngo2, coord_czero_ahalf_bngo2_conj,
-     coord_czero_aall_bhalf, coord_czero_aall_bhalf_conj,
-     coord_cngo2_real, coord_cngo2_azero_bhalf, coord_cngo2_azero_bhalf_conj,
-     coord_cngo2_ahalf_bzero, coord_cngo2_ahalf_bzero_conj,
-     coord_cngo2_ahalf_bngo2, coord_cngo2_ahalf_bngo2_conj,
-     coord_cngo2_aall_bhalf, coord_cngo2_aall_bhalf_conj) = indep_coord(ng)
-    
-    idx_conjugate_re = np.hstack([0,
-                                   coord_czero_azero_bhalf_conj,
-                                   coord_czero_ahalf_bzero_conj,
-                                   coord_czero_ahalf_bngo2_conj,
-                                   coord_czero_aall_bhalf_conj.ravel(),
-                                   coord_cngo2_azero_bhalf_conj,
-                                   coord_cngo2_ahalf_bzero_conj,
-                                   coord_cngo2_ahalf_bngo2_conj,
-                                   coord_cngo2_aall_bhalf_conj.ravel()])
+# --- private helpers for keep-mask based extraction ---
+def _unflatten_abc(ng: int):
+    """Return flattened (a,b,c) coordinates for rfftn layout of shape (ng, ng, ng//2+1)."""
+    ngo2 = ng // 2
+    a = jnp.arange(ng, dtype=jnp.int32)[:, None, None]
+    b = jnp.arange(ng, dtype=jnp.int32)[None, :, None]
+    c = jnp.arange(ngo2 + 1, dtype=jnp.int32)[None, None, :]
+    A = jnp.broadcast_to(a, (ng, ng, ngo2 + 1))
+    B = jnp.broadcast_to(b, (ng, ng, ngo2 + 1))
+    C = jnp.broadcast_to(c, (ng, ng, ngo2 + 1))
+    return A.reshape(-1), B.reshape(-1), C.reshape(-1)
 
-    idx_conjugate_im = np.hstack([coord_czero_real,
-                                   coord_cngo2_real,
-                                   coord_czero_azero_bhalf_conj,
-                                   coord_czero_ahalf_bzero_conj,
-                                   coord_czero_ahalf_bngo2_conj,
-                                   coord_czero_aall_bhalf_conj.ravel(),
-                                   coord_cngo2_azero_bhalf_conj,
-                                   coord_cngo2_ahalf_bzero_conj,
-                                   coord_cngo2_ahalf_bngo2_conj,
-                                   coord_cngo2_aall_bhalf_conj.ravel()])
-    
-    return jnp.asarray(idx_conjugate_re, dtype=jnp.int32), jnp.asarray(idx_conjugate_im, dtype=jnp.int32)
-
-def _build_keep_indices(num: int, idx_delete) -> jnp.ndarray:
-    """Return keep indices as int32 for jnp.take."""
-    # Use JAX so the result can be a device constant closed over by a jitted fn
-    mask = jnp.ones((num,), dtype=bool)
-    mask = mask.at[jnp.array(idx_delete, dtype=jnp.int32)].set(False)
-    keep = jnp.nonzero(mask, size=None)[0]
-    return keep.astype(jnp.int32)
-
-def build_indep_taker(ng: int,
-                      idx_conjugate_real,
-                      idx_conjugate_imag):
+def _conj_flat_indices(ng: int):
     """
-    Precompute 'keep' indices once and return a gather-based extractor:
-      taker(fieldk) -> stacked [Re_keep, Im_keep]
+    For each flattened rfftn index, return the flattened index of its Hermitian conjugate.
     """
+    A, B, C = _unflatten_abc(ng)  # (num,)
+    ng_i32 = jnp.int32(ng)
+    Aconj = (ng_i32 - A) % ng_i32
+    Bconj = (ng_i32 - B) % ng_i32
+    Cconj = C  # c stays within [0..ng/2]
+    idx = ((A * ng_i32 + B) * (ng_i32 // 2 + 1) + C).astype(jnp.int32)
+    jdx = ((Aconj * ng_i32 + Bconj) * (ng_i32 // 2 + 1) + Cconj).astype(jnp.int32)
+    return idx, jdx
+
+# --- keep builders (mask-based, recommended) ---
+def build_keep_conjugate_only(ng: int):
+    """
+    No k-mask. Choose one representative per conjugate pair on the full grid.
+    keep_re includes all representatives; keep_im excludes self-conjugate (pure-real) modes.
+    """
+    idx, jdx = _conj_flat_indices(ng)
+    self_conj = (idx == jdx)
+    pick_left = (idx < jdx)         # pick only one side of each pair
+    keep_rep = pick_left | self_conj
+    keep_re = jnp.nonzero(keep_rep, size=None)[0].astype(jnp.int32)
+    keep_im = jnp.nonzero(keep_rep & (~self_conj), size=None)[0].astype(jnp.int32)
+    return keep_re, keep_im
+
+def build_keep_spherical(ng: int, boxsize: float, kmax: float, dtype=jnp.float32):
+    """
+    Spherical cut (|k| <= kmax) AND unique representative per conjugate pair.
+    Self-conjugate (pure-real) modes are kept only in Re set.
+    """
+    # build |k|^2 on the rfftn layout
+    kx, ky, kz = coord.kaxes_1d(ng, boxsize, dtype=dtype)   # (ng,), (ng,), (ng//2+1,)
+    k2 = (kx**2)[:, None, None] + (ky**2)[None, :, None] + (kz**2)[None, None, :]
     num = ng * ng * (ng // 2 + 1)
-    keep_re = _build_keep_indices(num, idx_conjugate_real)
-    keep_im = _build_keep_indices(num, idx_conjugate_imag)
+    k2 = k2.reshape((num,))
+    below = (k2 <= (kmax * kmax))  # True inside the sphere
 
-    @jit
-    def taker(fieldk: jnp.ndarray) -> jnp.ndarray:
-        # fieldk: (ng, ng, ng//2+1) complex
-        f1d = fieldk.reshape(-1)
-        re = jnp.take(f1d.real, keep_re, mode='clip')
-        im = jnp.take(f1d.imag, keep_im, mode='clip')
-        return jnp.concatenate([re, im], axis=0)
+    # conjugate pairs
+    idx, jdx = _conj_flat_indices(ng)
+    self_conj = (idx == jdx)
+    pick_left  = (idx < jdx)
+    pick_right = (~pick_left) & (~self_conj)
 
-    return taker, keep_re, keep_im
+    # representative selection with spherical mask
+    keep_rep = (below & pick_left) | (below[jdx] & pick_right) | (below & self_conj)
 
-def _delete_mask(num: int, del_idx) -> jnp.ndarray:
-    """Return a boolean mask where True means 'to be deleted'."""
-    mask = jnp.zeros((num,), dtype=bool)
-    return mask.at[jnp.asarray(del_idx, dtype=jnp.int32)].set(True)
+    keep_re = jnp.nonzero(keep_rep, size=None)[0].astype(jnp.int32)
+    keep_im = jnp.nonzero(keep_rep & (~self_conj), size=None)[0].astype(jnp.int32)
+    return keep_re, keep_im
 
-def build_indep_taker_with_keep(ng: int,
-                                keep_re: jnp.ndarray,
-                                keep_im: jnp.ndarray):
+def build_indep_taker_with_keep(ng: int, keep_re: jnp.ndarray, keep_im: jnp.ndarray):
     """
-    Return a gather-based extractor with precomputed keep indices.
-
-    keep_re / keep_im must be 1D int32 arrays of indices into the flattened rfftn layout.
+    Create a gather-based extractor: taker(fieldk) -> concat([Re_keep, Im_keep]).
+    keep_re/keep_im are flattened rfftn indices (int32).
     """
     keep_re = jnp.asarray(keep_re, dtype=jnp.int32)
     keep_im = jnp.asarray(keep_im, dtype=jnp.int32)
 
     @jit
     def taker(fieldk: jnp.ndarray) -> jnp.ndarray:
-        # fieldk: (ng, ng, ng//2+1) complex
+        # fieldk: complex array of shape (ng, ng, ng//2+1) in rfftn layout
         f1d = fieldk.reshape(-1)
         re = jnp.take(f1d.real, keep_re, mode='clip')
         im = jnp.take(f1d.imag, keep_im, mode='clip')
@@ -176,43 +160,6 @@ def build_indep_taker_with_keep(ng: int,
 
     return taker, keep_re, keep_im
 
-def build_keep_from_delete_and_kmax(ng: int,
-                                    boxsize: float,
-                                    kmax: float,
-                                    del_re,
-                                    del_im,
-                                    dtype=jnp.float32):
-    """
-    Build keep indices for independent modes under a spherical cut (k^2 <= kmax^2).
-
-    We intersect:
-      - below-k mask (spherical)
-      - complement of conjugate-delete mask (from indep_coord_stack)
-    """
-    # number of complex rfftn modes
-    num = ng * ng * (ng // 2 + 1)
-
-    # build k^2 on rfftn grid (3D), then flatten
-    kx, ky, kz = coord.kaxes_1d(ng, boxsize, dtype=dtype)
-    kx2 = kx**2
-    ky2 = ky**2
-    kz2 = kz**2
-    k2 = (kx2[:, None, None] + ky2[None, :, None] + kz2[None, None, :]).reshape((num,))
-    below = (k2 <= (kmax * kmax))
-
-    # delete masks for conjugates (True=delete), then complement to keep
-    del_mask_re = _delete_mask(num, del_re)
-    del_mask_im = _delete_mask(num, del_im)
-    keep_mask_re = (~del_mask_re) & below
-    keep_mask_im = (~del_mask_im) & below
-
-    keep_re = jnp.nonzero(keep_mask_re, size=None)[0].astype(jnp.int32)
-    keep_im = jnp.nonzero(keep_mask_im, size=None)[0].astype(jnp.int32)
-    return keep_re, keep_im
-
-def _gauss_plan(ng: int):
-    """Precompute index tuples once on host; returned arrays are NumPy int32."""
-    return indep_coord(ng)
 
 @partial(jit, static_argnames=('ng',))
 def gauss_1d_to_3d(gaussian_1d: jnp.ndarray, ng: int):
@@ -350,7 +297,6 @@ def build_gauss_1d_to_3d(ng: int):
 
     @jit
     def _fn(gaussian_1d: jnp.ndarray) -> jnp.ndarray:
-        # same math as your current gauss_1d_to_3d, but indep_coord(ng) を呼ばない
         ng2  = ng * ng
         ng3  = ng * ng * ng
         ngo2 = ng // 2
