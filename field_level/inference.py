@@ -168,6 +168,61 @@ def _as_scalar(cfg):
         return float(cfg)
     return float(cfg[0])
 
+def _is_free(cfg):
+    """Two numbers => treat as free (sampled); one number (or scalar) => fixed."""
+    return _seq_len(cfg) == 2
+
+def _det_if(name, value, cond):
+    """Record as deterministic only when cond=True."""
+    return numpyro.deterministic(name, value) if cond else value
+
+def _resolve_pair_scaled_raw(
+    params_dict,
+    scaled_key,              # e.g., "A2b2"
+    raw_key,                 # e.g., "b2"
+    factor,                  # e.g., A**2
+    draw_scaled,             # e.g., draw_normal_or_fix
+    draw_raw,                # e.g., draw_normal_or_fix / draw_uniform_or_fix
+    default_raw,             # default for raw when neither key is provided
+    record_derived_if_sampled=True,
+):
+    """
+    Resolve a linked parameter pair (scaled_key <-> factor * raw_key).
+
+    Priority (keeps your current behavior):
+      - If scaled_key is present:
+          * free  -> sample scaled; raw = deterministic(scaled/factor)
+          * fixed -> scaled=const;  raw = scaled/factor         (no deterministic)
+      - elif raw_key is present:
+          * free  -> sample raw;    scaled = deterministic(factor*raw)
+          * fixed -> raw=const;     scaled = factor*raw         (no deterministic)
+      - else:
+          * raw = default_raw; scaled = factor*raw              (no deterministic)
+
+    Returns (raw_value, scaled_value).
+    """
+    if scaled_key in params_dict:
+        cfg = params_dict[scaled_key]
+        if _is_free(cfg):
+            scaled = draw_scaled(scaled_key, cfg)
+            raw    = _det_if(raw_key, scaled / factor, record_derived_if_sampled)
+        else:
+            scaled = _as_scalar(cfg)
+            raw    = scaled / factor
+    elif raw_key in params_dict:
+        cfg = params_dict[raw_key]
+        if _is_free(cfg):
+            raw    = draw_raw(raw_key, cfg)
+            scaled = _det_if(scaled_key, factor * raw, record_derived_if_sampled)
+        else:
+            raw    = _as_scalar(cfg)
+            scaled = factor * raw
+    else:
+        raw    = default_raw
+        scaled = factor * raw
+    return raw, scaled
+
+
 def draw_uniform_or_fix(name, cfg):
     """Accepts scalar or [x] or [lo, hi]; samples Uniform for len==2, otherwise fixes the value."""
     n = _seq_len(cfg)
@@ -701,21 +756,32 @@ def field_inference(boxsize, redshift, which_pk,
     # --- Compute indices & build extractor for independent modes (k_space) ---
     if which_space == 'k_space':
         if kmax > 1.0:
-            # Cubic cutoff: just downsample the grid and keep one representative per conjugate pair.
             ng_max = int(kmax)
-            keep_re, keep_im = idx.build_keep_conjugate_only(ng_max)
-            indep_take, keep_re, keep_im = idx.build_indep_taker_with_keep(ng_max, keep_re, keep_im)
+            if ng < ng_max:
+                raise ValueError(f'kmax={kmax} requires ng >= {ng_max}')
+            idx_re, idx_im = idx.indep_modes_kmax_indices(ng_max, kmax=None)
         else:
-            # Spherical cutoff on the full 'ng' grid: pick modes inside the sphere and keep one per conjugate pair.
             ng_max = ng
-            keep_re, keep_im = idx.build_keep_spherical(ng, boxsize, kmax, dtype=r_dtype)
-            indep_take, keep_re, keep_im = idx.build_indep_taker_with_keep(ng, keep_re, keep_im)
-
-        logger.info('keep_re.shape = %s, keep_im.shape = %s', tuple(keep_re.shape), tuple(keep_im.shape))
+            idx_re, idx_im = idx.indep_modes_kmax_indices(
+                ng_max, kx=fwd_model.kx_, ky=fwd_model.ky_, kz=fwd_model.kz_, kmax=float(kmax)
+            )        
     elif which_space == 'r_space':
         kmax = int(kmax)
         ng_max = kmax
+        if ng < ng_max:
+            raise ValueError(f'kmax={kmax} requires ng >= {ng_max}')
         ng3_max = ng_max ** 3
+
+    @jit
+    def independent_modes(fieldk):
+        """
+        Return independent modes as a 1D vector:
+        [Re kept..., Im kept...], order matches ravel() scan order.
+        """
+        fk = fieldk.reshape(-1)
+        re = jnp.take(fk.real, idx_re)
+        im = jnp.take(fk.imag, idx_im)
+        return jnp.hstack([re, im])
 
     # Load the data
     data = load_data(data_path)
@@ -723,8 +789,14 @@ def field_inference(boxsize, redshift, which_pk,
     # Preprocess data to 1D (depending on space)
     if which_space == 'k_space':
         data[0,0,0] = 0.0  # Remove DC mode
-        data_max = PT_field.func_reduce(ng_max, data)
-        data_1d_ind = indep_take(data_max)
+        if ng_max < data.shape[0]:
+            data_max = PT_field.func_reduce(ng_max, data)
+        elif ng_max > data.shape[0]:
+            logger.warning(f'Input data size {data.shape[0]} < ng {ng}; padding with zeros.')     
+            data_max = PT_field.func_extend(ng_max, data)
+        else:
+            data_max = data
+        data_1d_ind = independent_modes(data_max)
     elif which_space == 'r_space':
         if data.shape[2] != data.shape[0]:
             logger.info('Data is in Fourier space.')
@@ -747,10 +819,6 @@ def field_inference(boxsize, redshift, which_pk,
     # -----------------------------
     # Model definition
     # -----------------------------
-
-    #def model(obs_data):
-    #    x = numpyro.sample("gauss_1d", dist.Normal(0., 1.))
-    #    numpyro.sample("y", dist.Normal(x, 1.), obs=obs_data[:1])  # 1要素だけ使う
     
     def model(obs_data):
         if which_ics == 'varied_ics':
@@ -813,68 +881,65 @@ def field_inference(boxsize, redshift, which_pk,
         A3 = A * A * A
 
         # Bias parameters sampling
-        if 'Ab1' in bias_params:
-            Ab1 = draw_uniform_or_fix('Ab1', bias_params['Ab1'])
-            b1  = numpyro.deterministic('b1', Ab1 / A)
-        elif 'b1' in bias_params:
-            b1  = draw_uniform_or_fix('b1', bias_params['b1'])
-            Ab1 = numpyro.deterministic('Ab1', A * b1)
-        else:
-            b1  = 1.0
+        # (Ab1, b1): uniform; default b1=1.0
+        b1, Ab1 = _resolve_pair_scaled_raw(
+            bias_params, "Ab1", "b1", A,
+            draw_scaled=draw_uniform_or_fix,
+            draw_raw=draw_uniform_or_fix,
+            default_raw=1.0,
+        )
 
-        if 'A2b2' in bias_params:
-            A2b2 = draw_normal_or_fix('A2b2', bias_params['A2b2'])
-            b2   = numpyro.deterministic('b2', A2b2 / A2)
-        elif 'b2' in bias_params:
-            b2 = draw_normal_or_fix('b2', bias_params['b2'])
-            A2b2 = numpyro.deterministic('A2b2', A2 * b2)
-        else:
-            b2   = 0.0
+        # (A2b2, b2): normal; default b2=0.0
+        b2, A2b2 = _resolve_pair_scaled_raw(
+            bias_params, "A2b2", "b2", A2,
+            draw_scaled=draw_normal_or_fix,
+            draw_raw=draw_normal_or_fix,
+            default_raw=0.0,
+        )
 
-        if 'A2bG2' in bias_params:
-            A2bG2 = draw_normal_or_fix('A2bG2', bias_params['A2bG2'])
-            bG2   = numpyro.deterministic('bG2', A2bG2 / A2)
-        elif 'bG2' in bias_params:
-            bG2   = draw_normal_or_fix('bG2', bias_params['bG2'])
-            A2bG2 = numpyro.deterministic('A2bG2', A2 * bG2)
+        # (A2bG2, bG2): special-case for 'G2' models
+        if 'G2' in model_name:
+            bG2  = b1
+            A2bG2 = A2 * bG2
         else:
-            bG2   = 0.0
+            bG2, A2bG2 = _resolve_pair_scaled_raw(
+                bias_params, "A2bG2", "bG2", A2,
+                draw_scaled=draw_normal_or_fix,
+                draw_raw=draw_normal_or_fix,
+                default_raw=0.0,
+            )
         
-        if 'A3bGamma3' in bias_params:
-            A3bGamma3 = draw_normal_or_fix('A3bGamma3', bias_params['A3bGamma3'])
-            bGamma3   = numpyro.deterministic('bGamma3', A3bGamma3 / A3)
-        elif 'bGamma3' in bias_params:
-            bGamma3   = draw_normal_or_fix('bGamma3', bias_params['bGamma3'])
-            A3bGamma3 = numpyro.deterministic('A3bGamma3', A3 * bGamma3)
-        else:
-            bGamma3   = 0.0
+        # (A3bGamma3, bGamma3): normal; default bGamma3=0.0
+        bGamma3, A3bGamma3 = _resolve_pair_scaled_raw(
+            bias_params, "A3bGamma3", "bGamma3", A3,
+            draw_scaled=draw_normal_or_fix,
+            draw_raw=draw_normal_or_fix,
+            default_raw=0.0,
+        )
 
-        if 'A3b3' in bias_params:
-            A3b3 = draw_normal_or_fix('A3b3', bias_params['A3b3'])
-            b3   = numpyro.deterministic('b3', A3b3 / A3)
-        elif 'b3' in bias_params:
-            b3   = draw_normal_or_fix('b3', bias_params['b3'])
-            A3b3 = numpyro.deterministic('A3b3', A3 * b3)
-        else:
-            b3   = 0.0
+        # (A3b3, b3): normal; default b3=0.0
+        b3, A3b3 = _resolve_pair_scaled_raw(
+            bias_params, "A3b3", "b3", A3,
+            draw_scaled=draw_normal_or_fix,
+            draw_raw=draw_normal_or_fix,
+            default_raw=0.0,
+        )
 
-        if 'A3bG2d' in bias_params:
-            A3bG2d = draw_normal_or_fix('A3bG2d', bias_params['A3bG2d'])
-            bG2d   = numpyro.deterministic('bG2d', A3bG2d / A3)
-        elif 'bG2d' in bias_params:
-            bG2d   = draw_normal_or_fix('bG2d', bias_params['bG2d'])
-            A3bG2d = numpyro.deterministic('A3bG2d', A3 * bG2d)
-        else:
-            bG2d   = 0.0
-
-        if 'A3bG3' in bias_params:
-            A3bG3 = draw_normal_or_fix('A3bG3', bias_params['A3bG3'])
-            bG3   = numpyro.deterministic('bG3', A3bG3 / A3)
-        elif 'bG3' in bias_params:
-            bG3   = draw_normal_or_fix('bG3', bias_params['bG3'])
-            A3bG3 = numpyro.deterministic('A3bG3', A3 * bG3)
-        else:
-            bG3 = 0.0
+        # (A3bG2d, bG2d): normal; default bG2d=0.0
+        bG2d, A3bG2d = _resolve_pair_scaled_raw(
+            bias_params, "A3bG2d", "bG2d", A3,
+            draw_scaled=draw_normal_or_fix,
+            draw_raw=draw_normal_or_fix,
+            default_raw=0.0,
+        )
+        
+        # (A3bG3, bG3): normal; default bG3=0.0
+        bG3, A3bG3 = _resolve_pair_scaled_raw(
+            bias_params, "A3bG3", "bG3", A3,
+            draw_scaled=draw_normal_or_fix,
+            draw_raw=draw_normal_or_fix,
+            default_raw=0.0,
+        )
 
         # Counter terms
         c0 = draw_normal_or_fix('c0', bias_params.get('c0', 0.0))
@@ -924,13 +989,11 @@ def field_inference(boxsize, redshift, which_pk,
             n = _seq_len(cfg)
             if n == 2:
                 mean, std = float(cfg[0]), float(cfg[1])
-                if mean > 10.0:
-                    mean = jnp.log((vol / mean) ** 3)
                 log_Perr = numpyro.sample("log_Perr", dist.Normal(mean, std))
                 Perr = jnp.exp(log_Perr)
-            elif n >= 1:
+            elif n == 1:
                 val = _as_scalar(cfg)
-                Perr = (vol / val) ** 3 if val > 10.0 else jnp.exp(val)
+                Perr = jnp.exp(val)
             else:
                 raise ValueError("err_params['log_Perr'] is required")
 
@@ -939,44 +1002,36 @@ def field_inference(boxsize, redshift, which_pk,
         elif which_space == 'r_space':
             sigma2_err = Perr * ng3_max / vol
 
-        if 'log_Peded' in err_params:
+        if 'log_Peded' in err_params: ### only in r_space
             cfg = err_params['log_Peded']
             n = _seq_len(cfg)
             if n == 2:
                 mean, std = float(cfg[0]), float(cfg[1])
                 log_Peded = numpyro.sample("log_Peded", dist.Normal(mean, std))
                 Peded = numpyro.deterministic("Peded", jnp.exp(log_Peded))
-            elif n >= 1:
+            elif n == 1:
                 Peded = jnp.exp(_as_scalar(cfg))
             else:
                 raise ValueError("Bad err_params['log_Peded']")
 
             bound = jnp.sqrt(Perr * Peded)
-            if which_space == 'k_space':
-                sigma2_eded = jnp.sqrt(Peded / (2.0 * vol))
-            elif which_space == 'r_space':
-                sigma2_eded = Peded * ng3_max / vol
+            sigma2_eded = Peded * ng3_max / vol
 
             scaled_Peed = numpyro.sample("scaled_Peed", dist.Uniform(-1.0, 1.0))
             Peed = numpyro.deterministic("Peed", scaled_Peed * bound)
             ratio = numpyro.deterministic("ratio", Peed / Peded)
 
-            if which_space == 'k_space':
-                Perr_eff = numpyro.deterministic("Perr_eff", Perr - Peed * Peed / Peded)
-                sigma_err = jnp.sqrt(Perr_eff / (2.0 * vol))
-            elif which_space == 'r_space':
-                sigma2_eed = Peed * ng3_max / vol
+            sigma2_eed = Peed * ng3_max / vol
 
         delk = A * fwd_model.linear_modes(pk_lin_table, gauss_3d)
         delk_L = PT_field.func_extend(ng_L, delk)
-        #field_k_E = delk
 
         if isinstance(fwd_model, LPT_Forward):
-            fields_k_E = fwd_model.get_shifted_fields(delk_L, growth_f)
+            fields_k_E = fwd_model.get_shifted_fields(delk_L, growth_f=growth_f)
         if isinstance(fwd_model, EPT_Forward):
             fields_k_E = fwd_model.get_fields(delk_L)
-        #print('fields_k_E.shape = ', fields_k_E.shape, file=sys.stderr)
         field_k_E = fwd_model.get_final_field(fields_k_E, betas, beta_type='const')
+        field_k_E = field_k_E.at[0,0,0].set(0.0)
 
         if which_space == 'k_space':
             need_sigma = any(k in bias_params for k in ('Sigma2', 'Sigma2_mu2', 'Sigma2_mu4'))
@@ -997,11 +1052,13 @@ def field_inference(boxsize, redshift, which_pk,
                 field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * kx2E)
                 field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * ky2E)
                 field_k_E = field_k_E * jnp.exp(-0.5 * Sigma2 * kz2E)
-            if ng_max != field_k_E.shape[0]:
+            if ng_max < field_k_E.shape[0]:
                 field_k_max = PT_field.func_reduce(ng_max, field_k_E)
+            elif ng_max > field_k_E.shape[0]:
+                field_k_max = PT_field.func_extend(ng_max, field_k_E)
             else:
                 field_k_max = field_k_E
-            field_1d_ind = indep_take(field_k_max)
+            field_1d_ind = independent_modes(field_k_max)
         elif which_space == 'r_space':
             field_k_max = PT_field.func_reduce(ng_max, field_k_E)
             field_r_max = jnp.fft.irfftn(field_k_max, norm='forward')
@@ -1023,8 +1080,6 @@ def field_inference(boxsize, redshift, which_pk,
     n_total = thin * n_samples
     i_sample = DEFAULT_I_SAMPLE
     i_iter = int(n_total / i_sample)
-
-    #dense_arg = None if not dense_mass else dense_mass
 
     if i_contd > 0:
         kernel = NUTS(model=model,
