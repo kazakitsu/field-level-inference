@@ -833,13 +833,18 @@ def field_inference(boxsize, redshift, which_pk,
             omega_b = sample_uniform_deterministic_or_fix('ob',     'scaled_ob',     cosmo_params.get('ob',     None), OMEGA_B_TRUE)
             ns      = sample_uniform_deterministic_or_fix('ns',     'scaled_ns',     cosmo_params.get('ns',     None), NS_TRUE)
 
-            if len(cosmo_params['oc']) == 2 or len(cosmo_params['ob']) == 2 or len(cosmo_params['hubble']) == 2:
-                OM = numpyro.deterministic('OM', (omega_b + omega_c) / hubble**2)
-            else:
-                OM = (omega_b + omega_c) / hubble**2
+            oc_cfg = cosmo_params.get('oc', None)
+            ob_cfg = cosmo_params.get('ob', None)
+            h_cfg  = cosmo_params.get('hubble', None)
 
-            if len(cosmo_params['hubble']) == 2:
+            any_free = any(_is_free(cfg) for cfg in (oc_cfg, ob_cfg, h_cfg))
+            OM_val = (omega_b + omega_c) / hubble**2
+            OM = _det_if('OM', OM_val, any_free)
+
+            if _is_free(h_cfg):
                 H0 = numpyro.deterministic('H0', 100.0 * hubble)
+            else:
+                H0 = 100.0 * hubble
 
             if 'ln1010As' in cosmo_params:
                 ln1010As = cosmo_params['ln1010As'][0]
