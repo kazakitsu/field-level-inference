@@ -1033,6 +1033,11 @@ def field_inference(boxsize, redshift, which_pk,
 
         if isinstance(fwd_model, LPT_Forward):
             fields_k_E = fwd_model.get_shifted_fields(delk_L, growth_f=growth_f)
+            ### for G2_zz
+            if fwd_model.rsd == True and fwd_model.bias_order >= 2:
+                G2_zz_idx = 4
+                fields_k_E = jnp.concatenate([fields_k_E[:G2_zz_idx], fields_k_E[G2_zz_idx+1:]],
+                                              axis=0)
         if isinstance(fwd_model, EPT_Forward):
             fields_k_E = fwd_model.get_fields(delk_L)
         field_k_E = fwd_model.get_final_field(fields_k_E, betas, beta_type='const')
