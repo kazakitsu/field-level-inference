@@ -1,6 +1,6 @@
 # Cosmology inference at the field level with perturbative forward modeling
 
-A lightweight pipeline for field level Bayesian inference of large scale structure with JAX and NumPyro.  
+A pipeline for field-level Bayesian inference of large scale structure with JAX and NumPyro.  
 This repository connects a perturbative forward model to a field level likelihood and runs NUTS with a restartable state.
 
 *Based on Akitsu, Simonović, Chen, Cabass, and Zaldarriaga (arXiv:2509.xxxx).*
@@ -22,7 +22,7 @@ This repository connects a perturbative forward model to a field level likelihoo
 - NumPy >= 2.1
 - JAX >= 0.4.3
 - NumPyro
-- CosmoPower JAX (differentiable linear power spectrum)
+- CosmoPower-JAX (for a differentiable linear power spectrum)
 - [`lss_utils`](https://github.com/kazakitsu/lss_utils)
 - [`PT_field`](https://github.com/kazakitsu/PT-field-modeling)
 
