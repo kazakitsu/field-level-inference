@@ -3,14 +3,14 @@
 A pipeline for field-level Bayesian inference of large scale structure with JAX and NumPyro.  
 This repository connects a perturbative forward model to a field level likelihood and runs NUTS with a restartable state.
 
-*Based on Akitsu, Simonović, Chen, Cabass, and Zaldarriaga (arXiv:2509.xxxx).*
+*Based on Akitsu, Simonović, Chen, Cabass, and Zaldarriaga ([arXiv:2509.09673](https://arxiv.org/abs/2509.09673)).*
 
 ---
 
 ## Features
 
-- Gaussian field level likelihood in Fourier space or real space  
-  - For the real space likelihood, a density dependent variance is available.
+- Gaussian field-level likelihood in Fourier space or position space  
+  - For the position-space likelihood, a density-dependent variance is available.
 - Forward models: Gaussian linear field, Eulerian PT up to second order, and Lagrangian PT with first or second order displacement (shifted operators), with up to quadratic galaxy bias and counterterm coefficients.
 - Sampling: initial conditions (sampled or fixed), cosmology ($A$, $\omega_{\rm cdm}$, $H_0$, etc.), and bias parameters.
 
