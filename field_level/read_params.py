@@ -26,6 +26,18 @@ def _parse_numeric_value(value_str: str):
         return (float(parts[0]), float(parts[1]))
     return float(parts[0])
 
+def _all_tokens_numeric(value_str: str) -> bool:
+    """Return True iff every whitespace-separated token parses as float."""
+    parts = value_str.split()
+    if not parts:
+        return False
+    for p in parts:
+        try:
+            float(p)
+        except Exception:
+            return False
+    return True
+
 def _to_int(value: str):
     return int(float(value))  # allow "128.0" style inputs
 
@@ -39,6 +51,7 @@ def read_params(params_file: str):
 
     cosmo_params = {}
     bias_params  = {}
+    bias_ties    = {}
     err_params   = {}
 
     # Predeclare keys (we'll fill them if present).
@@ -126,7 +139,15 @@ def read_params(params_file: str):
                          'A2bG2', 'bG2', 'A3b3', 'b3', 'A3bG3', 'bG3',
                          'A3bGamma3', 'bGamma3', 'c0', 'c2', 'c4',
                          'Sigma2', 'Sigma2_mu2', 'Sigma2_mu4']:
-                bias_params[key] = _parse_numeric_value(value)
+                # If the value is numeric, treat it as prior/fixed as before.
+                # If non-numeric (e.g. "bG2 b1"), treat as a tie: raw -> raw.
+                val = value.strip()
+                if val and _all_tokens_numeric(val):
+                    bias_params[key] = _parse_numeric_value(val)
+                else:
+                    if val:
+                        target = val.split()[0]
+                        bias_ties[key] = target
             elif key in ['log_Perr', 'log_Peded', 'Perr_k2', 'log_Perr_k2mu2']:
                 err_params[key] = _parse_numeric_value(value)
             elif key == 'kmax':
@@ -177,6 +198,7 @@ def read_params(params_file: str):
         'which_space': which_space,
         'cosmo_params': cosmo_params,
         'bias_params': bias_params,
+        'bias_ties': bias_ties,
         'err_params': err_params,
         'kmax': kmax,
         'dense_mass': dense_mass,

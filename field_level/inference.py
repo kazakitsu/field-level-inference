@@ -270,7 +270,7 @@ def sample_uniform_deterministic(param_name, scaled_name, bounds):
     value = numpyro.deterministic(param_name, min_val + (max_val - min_val) * scaled)
     return value
 
-def _normalize_dense_mass_groups(dense_mass, cosmo_params):
+def _normalize_dense_mass_groups(dense_mass, cosmo_params, *, bias_ties=None):
     """
     Normalize user-provided dense_mass groups before passing to NUTS.
 
@@ -287,6 +287,18 @@ def _normalize_dense_mass_groups(dense_mass, cosmo_params):
 
     rename_targets = ("oc", "ob", "hubble", "ns", "sigma8")
 
+    tied_raw = set(bias_ties.keys()) if bias_ties else set()
+    raw_to_scaled = {
+        'b1': 'Ab1',
+        'b2': 'A2b2',
+        'bG2': 'A2bG2',
+        'b3': 'A3b3',
+        'bG2d': 'A3bG2d',
+        'bG3': 'A3bG3',
+        'bGamma3': 'A3bGamma3',
+    }
+    tied_scaled = {raw_to_scaled[r] for r in tied_raw if r in raw_to_scaled}
+
     def _is_uniform_two_tuple(cfg):
         return _seq_len(cfg) == 2
 
@@ -297,6 +309,8 @@ def _normalize_dense_mass_groups(dense_mass, cosmo_params):
                 return f"scaled_{name}"   # this sample site exists
             else:
                 return None               # fixed => no sample site; drop
+        if name in tied_raw or name in tied_scaled:
+            return None
         return name  # keep others untouched
 
     normalized = []
@@ -533,6 +547,7 @@ def field_inference(boxsize, redshift, which_pk,
                     cosmo_params, bias_params, err_params, kmax, 
                     dense_mass, mcmc_params, 
                     pk_params=None, true_gauss_3d=None,
+                    bias_ties=None,
                     **kwargs):
     r"""
     Field-level inference with numpyro NUTS
@@ -885,67 +900,73 @@ def field_inference(boxsize, redshift, which_pk,
         A2 = A * A
         A3 = A * A * A
 
+        bias_values = {}
+
+        def _resolve_with_tie(raw_key, scaled_key, factor, default_raw,
+                              draw_scaled, draw_raw):
+            """
+            if raw_key is in bias_ties, then deteministically set raw_key = bias_values[tie_target]
+            otherwise draw raw_key and scaled_key as usual
+            """
+            if raw_key in bias_ties:
+                target = bias_ties[raw_key]
+                if target not in bias_values:
+                    raise ValueError(f"Tie target '{target}' for '{raw_key}' "
+                                     f"must be defined earlier in the bias order.")
+                raw = bias_values[target]
+                numpyro.deterministic(raw_key, raw)
+                scaled = factor * raw
+                numpyro.deterministic(scaled_key, scaled)
+                return raw, scaled
+            else:
+                return _resolve_pair_scaled_raw(
+                    bias_params, scaled_key, raw_key, factor,
+                    draw_scaled, draw_raw, default_raw
+                )
+
         # Bias parameters sampling
         # (Ab1, b1): uniform; default b1=1.0
-        b1, Ab1 = _resolve_pair_scaled_raw(
-            bias_params, "Ab1", "b1", A,
-            draw_scaled=draw_uniform_or_fix,
-            draw_raw=draw_uniform_or_fix,
-            default_raw=1.0,
+        b1, Ab1 = _resolve_with_tie(
+            "b1", "Ab1", A, 1.0, draw_uniform_or_fix, draw_uniform_or_fix
         )
+        bias_values["b1"] = b1
 
         # (A2b2, b2): normal; default b2=0.0
-        b2, A2b2 = _resolve_pair_scaled_raw(
-            bias_params, "A2b2", "b2", A2,
-            draw_scaled=draw_normal_or_fix,
-            draw_raw=draw_normal_or_fix,
-            default_raw=0.0,
+        b2, A2b2 = _resolve_with_tie(
+            "b2", "A2b2", A2, 0.0, draw_normal_or_fix, draw_normal_or_fix
         )
+        bias_values["b2"] = b2
 
-        # (A2bG2, bG2): special-case for 'G2' models
-        if 'G2' in model_name:
-            bG2  = b1
-            A2bG2 = A2 * bG2
-        else:
-            bG2, A2bG2 = _resolve_pair_scaled_raw(
-                bias_params, "A2bG2", "bG2", A2,
-                draw_scaled=draw_normal_or_fix,
-                draw_raw=draw_normal_or_fix,
-                default_raw=0.0,
-            )
+        # (A2bG2, bG2): normal; default bG2=0.0
+        bG2, A2bG2 = _resolve_with_tie(
+            "bG2", "A2bG2", A2, 0.0, draw_normal_or_fix, draw_normal_or_fix
+        )
+        bias_values["bG2"] = bG2
         
-        # (A3bGamma3, bGamma3): normal; default bGamma3=0.0
-        bGamma3, A3bGamma3 = _resolve_pair_scaled_raw(
-            bias_params, "A3bGamma3", "bGamma3", A3,
-            draw_scaled=draw_normal_or_fix,
-            draw_raw=draw_normal_or_fix,
-            default_raw=0.0,
+        # (A3bGamma3, bGamma3)
+        bGamma3, A3bGamma3 = _resolve_with_tie(
+            "bGamma3", "A3bGamma3", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
         )
+        bias_values["bGamma3"] = bGamma3
 
-        # (A3b3, b3): normal; default b3=0.0
-        b3, A3b3 = _resolve_pair_scaled_raw(
-            bias_params, "A3b3", "b3", A3,
-            draw_scaled=draw_normal_or_fix,
-            draw_raw=draw_normal_or_fix,
-            default_raw=0.0,
+        # (A3b3, b3)
+        b3, A3b3 = _resolve_with_tie(
+            "b3", "A3b3", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
         )
+        bias_values["b3"] = b3
 
-        # (A3bG2d, bG2d): normal; default bG2d=0.0
-        bG2d, A3bG2d = _resolve_pair_scaled_raw(
-            bias_params, "A3bG2d", "bG2d", A3,
-            draw_scaled=draw_normal_or_fix,
-            draw_raw=draw_normal_or_fix,
-            default_raw=0.0,
+        # (A3bG2d, bG2d)
+        bG2d, A3bG2d = _resolve_with_tie(
+            "bG2d", "A3bG2d", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
         )
+        bias_values["bG2d"] = bG2d
+
+        # (A3bG3, bG3)
+        bG3, A3bG3 = _resolve_with_tie(
+            "bG3", "A3bG3", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
+        )
+        bias_values["bG3"] = bG3
         
-        # (A3bG3, bG3): normal; default bG3=0.0
-        bG3, A3bG3 = _resolve_pair_scaled_raw(
-            bias_params, "A3bG3", "bG3", A3,
-            draw_scaled=draw_normal_or_fix,
-            draw_raw=draw_normal_or_fix,
-            default_raw=0.0,
-        )
-
         # Counter terms
         c0 = draw_normal_or_fix('c0', bias_params.get('c0', 0.0))
         c2 = draw_normal_or_fix('c2', bias_params.get('c2', 0.0))
@@ -1085,7 +1106,9 @@ def field_inference(boxsize, redshift, which_pk,
     # -----------------------------
     # Setup before MCMC execution
     # -----------------------------
-    dense_mass = _normalize_dense_mass_groups(dense_mass, cosmo_params)
+    bias_ties = bias_ties or kwargs.get('param_ties') or {}
+    
+    dense_mass = _normalize_dense_mass_groups(dense_mass, cosmo_params, bias_ties=bias_ties)
     logger.info('dense_mass (scaled) = %s', dense_mass)
     n_total = thin * n_samples
     i_sample = DEFAULT_I_SAMPLE

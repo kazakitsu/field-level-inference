@@ -46,4 +46,5 @@ if __name__ == "__main__":
         params["cosmo_params"], params["bias_params"], params["err_params"],
         params["kmax"], params["dense_mass"], params["mcmc_params"],
         params["pk_params"], params["true_gauss_3d"],
+        bias_ties=params.get('bias_ties'),
     )
