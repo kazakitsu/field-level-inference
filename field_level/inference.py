@@ -293,7 +293,7 @@ def _normalize_dense_mass_groups(dense_mass, cosmo_params, *, bias_ties=None):
         'b2': 'A2b2',
         'bG2': 'A2bG2',
         'b3': 'A3b3',
-        'bG2d': 'A3bG2d',
+        'bdG2': 'A3bdG2',
         'bG3': 'A3bG3',
         'bGamma3': 'A3bGamma3',
     }
@@ -955,11 +955,11 @@ def field_inference(boxsize, redshift, which_pk,
         )
         bias_values["b3"] = b3
 
-        # (A3bG2d, bG2d)
-        bG2d, A3bG2d = _resolve_with_tie(
-            "bG2d", "A3bG2d", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
+        # (A3bdG2, bdG2)
+        bdG2, A3bdG2 = _resolve_with_tie(
+            "bdG2", "A3bdG2", A3, 0.0, draw_normal_or_fix, draw_normal_or_fix
         )
-        bias_values["bG2d"] = bG2d
+        bias_values["bdG2"] = bdG2
 
         # (A3bG3, bG3)
         bG3, A3bG3 = _resolve_with_tie(
@@ -982,7 +982,7 @@ def field_inference(boxsize, redshift, which_pk,
         elif 'quad' in model_name:
             betas = [b1, 0.5*b2, bG2,]
         elif 'cubic' in model_name:
-            betas = [b1, 0.5*b2, bG2, b3, bG2d, bG3, bGamma3,]
+            betas = [b1, 0.5*b2, bG2, b3, bdG2, bG3, bGamma3,]
         else:
             betas = []
 

@@ -135,7 +135,7 @@ def read_params(params_file: str):
                 dense_mass = [tuple(parts)] if parts else None
             elif key in ['A', 'sigma8', 'oc', 'hubble', 'ob', 'ns', 'ln1010As']:
                 cosmo_params[key] = _parse_numeric_value(value)
-            elif key in ['Ab1', 'b1', 'A2b2', 'b2', 'A3bG2d', 'bG2d',
+            elif key in ['Ab1', 'b1', 'A2b2', 'b2', 'A3bdG2', 'bdG2',
                          'A2bG2', 'bG2', 'A3b3', 'b3', 'A3bG3', 'bG3',
                          'A3bGamma3', 'bGamma3', 'c0', 'c2', 'c4',
                          'Sigma2', 'Sigma2_mu2', 'Sigma2_mu4']:
